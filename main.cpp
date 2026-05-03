@@ -3,21 +3,21 @@
 #include <QWidget>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
+#include <QGridLayout>
 #include <QLabel>
 #include <QPushButton>
 #include <QListWidget>
 #include <QTextEdit>
-#include <QLineEdit>
-#include <QSplitter>
+#include <QDoubleSpinBox>
+#include <QCheckBox>
+#include <QGroupBox>
 #include <QStatusBar>
 #include <QThread>
 #include <QTimer>
 #include <QScrollBar>
-#include <QFont>
-#include <QFontDatabase>
 #include <QMessageBox>
 
-// ── Windows / Bluetooth headers ──────────────────────────────────────────────
+// ── Windows / Bluetooth headers ────────────────────────────────────────────
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <winsock2.h>
@@ -29,18 +29,58 @@
 #include <QString>
 #include <QList>
 #include <atomic>
-#include <thread>
+#include <cstring>
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Data
+// Protocol constants (mirrors Harbinger proto.h)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Host → Device
+constexpr uint8_t MSG_PING        = 0x01;
+constexpr uint8_t MSG_AIM         = 0x02;
+constexpr uint8_t MSG_ARM         = 0x03;
+constexpr uint8_t MSG_SET_VOLTAGE = 0x04;
+constexpr uint8_t MSG_FIRE        = 0x05;
+
+// Device → Host
+constexpr uint8_t MSG_PONG        = 0x81;
+constexpr uint8_t MSG_STATE       = 0x82;
+constexpr uint8_t MSG_TELEMETRY   = 0x83;
+constexpr uint8_t MSG_SHOT        = 0x84;
+
+// ARM flags (2 bits per field; 0x01=false, 0x02=true, 0x00=no-change)
+constexpr uint8_t ARM_SHIFT_MASTER = 0;
+constexpr uint8_t ARM_SHIFT_TURRET = 2;
+constexpr uint8_t ARM_SHIFT_GUN    = 4;
+constexpr uint8_t ARM_FALSE        = 0x01;
+constexpr uint8_t ARM_TRUE         = 0x02;
+
+// STATE flags
+constexpr uint8_t STATE_MASTER_ARM = 0x01;
+constexpr uint8_t STATE_TURRET_ARM = 0x02;
+constexpr uint8_t STATE_GUN_ARM    = 0x04;
+
+// Packed message structs
+#pragma pack(push, 1)
+struct PktAim        { float heading; float elevation; };
+struct PktArm        { uint8_t flags; };
+struct PktSetVoltage { float voltage; };
+struct PktState      { uint8_t flags; float target_v; };
+struct PktTelemetry  { float heading; float elevation;
+                       float motorA_vel; float motorA_acc;
+                       float motorB_vel; float motorB_acc; };
+struct PktShotHeader { uint32_t total_shots; uint8_t stage_count; };
+struct PktShotStage  { uint32_t t_us; float v_mps; float drain_v; };
+#pragma pack(pop)
+
 // ─────────────────────────────────────────────────────────────────────────────
 struct BtDevice {
-    QString name;
-    BTH_ADDR address;      // 6-byte packed address
-    QString addressStr;
-    bool    authenticated;
-    bool    remembered;
-    bool    connected;
+    QString  name;
+    BTH_ADDR address;
+    QString  addressStr;
+    bool     authenticated;
+    bool     remembered;
+    bool     connected;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -58,15 +98,13 @@ public slots:
         params.fReturnRemembered    = TRUE;
         params.fReturnUnknown       = TRUE;
         params.fReturnConnected     = TRUE;
-        params.fIssueInquiry        = FALSE;   // active radio inquiry
-        params.cTimeoutMultiplier   = 0;      // 4 × 1.28 s ≈ 5 s inquiry
+        params.fIssueInquiry        = FALSE;
+        params.cTimeoutMultiplier   = 0;
 
         BLUETOOTH_DEVICE_INFO info{};
         info.dwSize = sizeof(info);
 
-        HBLUETOOTH_DEVICE_FIND hFind =
-            BluetoothFindFirstDevice(&params, &info);
-
+        HBLUETOOTH_DEVICE_FIND hFind = BluetoothFindFirstDevice(&params, &info);
         if (hFind) {
             do {
                 BtDevice dev;
@@ -85,22 +123,19 @@ public slots:
                     .arg((a >>  8) & 0xFF, 2, 16, QChar('0'))
                     .arg((a >>  0) & 0xFF, 2, 16, QChar('0'))
                     .toUpper();
-
                 found.append(dev);
             } while (BluetoothFindNextDevice(hFind, &info));
-
             BluetoothFindDeviceClose(hFind);
         }
-
         emit scanDone(found);
     }
-
 signals:
     void scanDone(QList<BtDevice> devices);
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Worker: owns the SOCKET and pumps reads on a background thread
+// Worker: owns the SOCKET, runs binary protocol RX parser on background thread,
+// and provides typed send methods invokable from any thread.
 // ─────────────────────────────────────────────────────────────────────────────
 class IoWorker : public QObject {
     Q_OBJECT
@@ -111,33 +146,128 @@ public:
 
 public slots:
     void run() {
-        char buf[4096];
+        uint8_t buf[512];
         while (!m_stop) {
-            int n = recv(m_sock, buf, sizeof(buf), 0);
+            int n = recv(m_sock, reinterpret_cast<char*>(buf), sizeof(buf), 0);
             if (n > 0) {
-                QByteArray data(buf, n);
-                emit received(data);
+                for (int i = 0; i < n; ++i)
+                    feedByte(buf[i]);
             } else {
-                // 0 = remote closed, SOCKET_ERROR = error
                 if (!m_stop) emit disconnected();
                 break;
             }
         }
     }
 
-    void sendData(QByteArray data) {
-        if (m_sock != INVALID_SOCKET) {
-            send(m_sock, data.constData(), data.size(), 0);
-        }
+    void sendPing() {
+        uint8_t b = MSG_PING;
+        sendRaw(&b, 1);
+    }
+
+    void sendAim(float heading, float elevation) {
+        PktAim pkt { heading, elevation };
+        sendMsg(MSG_AIM, &pkt, sizeof(pkt));
+    }
+
+    void sendArm(uint8_t flags) {
+        PktArm pkt { flags };
+        sendMsg(MSG_ARM, &pkt, sizeof(pkt));
+    }
+
+    void sendSetVoltage(float voltage) {
+        PktSetVoltage pkt { voltage };
+        sendMsg(MSG_SET_VOLTAGE, &pkt, sizeof(pkt));
+    }
+
+    void sendFire() {
+        uint8_t b = MSG_FIRE;
+        sendRaw(&b, 1);
     }
 
 signals:
-    void received(QByteArray data);
+    void packetReceived(uint8_t type, QByteArray payload);
     void disconnected();
 
 private:
-    SOCKET          m_sock = INVALID_SOCKET;
+    SOCKET            m_sock = INVALID_SOCKET;
     std::atomic<bool> m_stop{false};
+
+    // RX state machine (mirrors btTask.cpp parser)
+    enum class RxState { TYPE, PAYLOAD, SHOT_STAGES };
+    RxState    m_rxState    = RxState::TYPE;
+    uint8_t    m_rxType     = 0;
+    size_t     m_rxExpected = 0;
+    QByteArray m_rxBuf;
+
+    void feedByte(uint8_t b) {
+        switch (m_rxState) {
+        case RxState::TYPE: {
+            m_rxType = b;
+            m_rxBuf.clear();
+            size_t psiz = payloadSize(b);
+            if (psiz == SIZE_MAX) break; // unknown type, skip
+            if (b == MSG_SHOT) {
+                // read 5-byte header first (uint32_t total + uint8_t count)
+                m_rxExpected = 5;
+                m_rxState = RxState::PAYLOAD;
+            } else if (psiz == 0) {
+                emit packetReceived(b, QByteArray());
+            } else {
+                m_rxExpected = psiz;
+                m_rxState = RxState::PAYLOAD;
+            }
+            break;
+        }
+        case RxState::PAYLOAD:
+            m_rxBuf.append(static_cast<char>(b));
+            if (static_cast<size_t>(m_rxBuf.size()) >= m_rxExpected) {
+                if (m_rxType == MSG_SHOT) {
+                    PktShotHeader hdr;
+                    memcpy(&hdr, m_rxBuf.constData(), sizeof(hdr));
+                    if (hdr.stage_count == 0) {
+                        emit packetReceived(MSG_SHOT, m_rxBuf);
+                        m_rxState = RxState::TYPE;
+                    } else {
+                        // accumulate stage_count * 12 more bytes
+                        m_rxExpected = 5 + static_cast<size_t>(hdr.stage_count) * 12;
+                        m_rxState = RxState::SHOT_STAGES;
+                    }
+                } else {
+                    emit packetReceived(m_rxType, m_rxBuf);
+                    m_rxState = RxState::TYPE;
+                }
+            }
+            break;
+        case RxState::SHOT_STAGES:
+            m_rxBuf.append(static_cast<char>(b));
+            if (static_cast<size_t>(m_rxBuf.size()) >= m_rxExpected) {
+                emit packetReceived(MSG_SHOT, m_rxBuf);
+                m_rxState = RxState::TYPE;
+            }
+            break;
+        }
+    }
+
+    static size_t payloadSize(uint8_t type) {
+        switch (type) {
+        case MSG_PONG:      return 0;
+        case MSG_STATE:     return 5;  // uint8_t + float32
+        case MSG_TELEMETRY: return 24; // 6 * float32
+        case MSG_SHOT:      return 5;  // header (resolved to variable in feedByte)
+        default:            return SIZE_MAX;
+        }
+    }
+
+    void sendRaw(const uint8_t* data, size_t len) {
+        if (m_sock != INVALID_SOCKET)
+            send(m_sock, reinterpret_cast<const char*>(data), static_cast<int>(len), 0);
+    }
+
+    void sendMsg(uint8_t type, const void* payload, size_t len) {
+        sendRaw(&type, 1);
+        if (payload && len > 0)
+            sendRaw(static_cast<const uint8_t*>(payload), len);
+    }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -148,18 +278,13 @@ class MainWindow : public QMainWindow {
 
 public:
     MainWindow() {
-        // Winsock init
         WSADATA wsa{};
         if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
             QMessageBox::critical(nullptr, "Fatal", "WSAStartup failed.");
             std::exit(1);
         }
-
-        setWindowTitle("Harbinger — Bluetooth Terminal");
-        setMinimumSize(820, 580);
-        resize(1000, 680);
-
-        applyTheme();
+        setWindowTitle("Harbinger Control");
+        setMinimumSize(960, 640);
         buildUi();
     }
 
@@ -169,266 +294,223 @@ public:
     }
 
 private:
-    // ── UI pointers ────────────────────────────────────────────────────────
-    QListWidget *m_deviceList  = nullptr;
-    QPushButton *m_scanBtn     = nullptr;
-    QPushButton *m_connectBtn  = nullptr;
-    QPushButton *m_disconnBtn  = nullptr;
-    QTextEdit   *m_rxPane      = nullptr;
-    QLineEdit   *m_txLine      = nullptr;
-    QPushButton *m_sendBtn     = nullptr;
+    // ── Device list UI ───────────────────────────────────────────────────
+    QListWidget *m_deviceList = nullptr;
+    QPushButton *m_scanBtn    = nullptr;
+    QPushButton *m_connectBtn = nullptr;
+    QPushButton *m_disconnBtn = nullptr;
     QLabel      *m_statusLabel = nullptr;
 
-    // ── State ──────────────────────────────────────────────────────────────
+    // ── Command controls ───────────────────────────────────────────────
+    QDoubleSpinBox *m_headingSpin   = nullptr;
+    QDoubleSpinBox *m_elevationSpin = nullptr;
+    QPushButton    *m_aimBtn        = nullptr;
+    QCheckBox      *m_masterArmChk  = nullptr;
+    QCheckBox      *m_turretArmChk  = nullptr;
+    QCheckBox      *m_gunArmChk     = nullptr;
+    QPushButton    *m_applyArmBtn   = nullptr;
+    QDoubleSpinBox *m_voltageSpin   = nullptr;
+    QPushButton    *m_setVoltageBtn = nullptr;
+    QPushButton    *m_fireBtn       = nullptr;
+    QPushButton    *m_pingBtn       = nullptr;
+
+    // ── Telemetry / state display ────────────────────────────────────────
+    QLabel *m_telHeading   = nullptr;
+    QLabel *m_telElevation = nullptr;
+    QLabel *m_telAVel      = nullptr;
+    QLabel *m_telAAcc      = nullptr;
+    QLabel *m_telBVel      = nullptr;
+    QLabel *m_telBAcc      = nullptr;
+    QLabel *m_stateFlags   = nullptr;
+    QLabel *m_stateVoltage = nullptr;
+    QLabel *m_shotTotal    = nullptr;
+    QTextEdit *m_eventLog  = nullptr;
+
+    // ── Connection state ───────────────────────────────────────────────
     QList<BtDevice> m_devices;
-    SOCKET          m_sock      = INVALID_SOCKET;
-    QThread        *m_ioThread  = nullptr;
-    IoWorker       *m_ioWorker  = nullptr;
+    SOCKET          m_sock     = INVALID_SOCKET;
+    QThread        *m_ioThread = nullptr;
+    IoWorker       *m_ioWorker = nullptr;
 
-    // ── Theme ──────────────────────────────────────────────────────────────
-    void applyTheme() {
-        // Industrial-terminal aesthetic: near-black bg, amber accent
-        setStyleSheet(R"(
-            QMainWindow, QWidget {
-                background-color: #0d0f0e;
-                color: #c8c0a8;
-                font-family: "Consolas", "Courier New", monospace;
-                font-size: 13px;
-            }
-            QSplitter::handle { background: #1e221f; width: 2px; height: 2px; }
-
-            /* Left panel */
-            #leftPanel {
-                background: #0d0f0e;
-                border-right: 1px solid #1e2a22;
-            }
-            #panelTitle {
-                color: #e8b84b;
-                font-size: 11px;
-                font-weight: bold;
-                letter-spacing: 3px;
-                padding: 10px 12px 4px 12px;
-                border-bottom: 1px solid #1e2a22;
-            }
-            QListWidget {
-                background: #0d0f0e;
-                border: none;
-                outline: none;
-                padding: 4px;
-            }
-            QListWidget::item {
-                padding: 8px 10px;
-                border-bottom: 1px solid #141714;
-                color: #9ba89d;
-                border-radius: 2px;
-            }
-            QListWidget::item:selected {
-                background: #1a2e1e;
-                color: #e8b84b;
-                border-left: 2px solid #e8b84b;
-            }
-            QListWidget::item:hover:!selected {
-                background: #141a15;
-                color: #c8c0a8;
-            }
-
-            /* Buttons */
-            QPushButton {
-                background: #141a15;
-                color: #9ba89d;
-                border: 1px solid #2a3a2c;
-                border-radius: 2px;
-                padding: 6px 14px;
-                font-family: "Consolas", monospace;
-                font-size: 12px;
-                letter-spacing: 1px;
-            }
-            QPushButton:hover  { background: #1e2a1f; color: #c8c0a8; border-color: #3a5040; }
-            QPushButton:pressed { background: #0d0f0e; }
-            QPushButton:disabled { color: #3a4040; border-color: #1a1e1a; }
-
-            #primaryBtn {
-                background: #1a3320;
-                color: #e8b84b;
-                border: 1px solid #2a5030;
-                font-weight: bold;
-            }
-            #primaryBtn:hover  { background: #1e3d25; border-color: #e8b84b; }
-            #primaryBtn:disabled { background: #0d0f0e; color: #2a3a2a; border-color: #1a1e1a; }
-
-            #dangerBtn {
-                background: #2a1010;
-                color: #c05050;
-                border: 1px solid #3a1818;
-            }
-            #dangerBtn:hover { background: #331515; color: #e06060; border-color: #c05050; }
-            #dangerBtn:disabled { background: #0d0f0e; color: #2a1a1a; border-color: #1a1010; }
-
-            /* RX pane */
-            QTextEdit {
-                background: #080a09;
-                color: #7ec87e;
-                border: 1px solid #1e2a1e;
-                border-radius: 2px;
-                padding: 8px;
-                font-family: "Consolas", "Courier New", monospace;
-                font-size: 12px;
-                selection-background-color: #1a3320;
-            }
-            QScrollBar:vertical {
-                background: #0d0f0e; width: 8px;
-                border: none;
-            }
-            QScrollBar::handle:vertical {
-                background: #2a3a2c; border-radius: 4px; min-height: 20px;
-            }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-
-            /* TX line */
-            QLineEdit {
-                background: #080a09;
-                color: #c8c0a8;
-                border: 1px solid #1e2a1e;
-                border-radius: 2px;
-                padding: 6px 10px;
-                font-family: "Consolas", monospace;
-                font-size: 12px;
-                selection-background-color: #1a3320;
-            }
-            QLineEdit:focus { border-color: #e8b84b; }
-
-            /* Status bar */
-            QStatusBar {
-                background: #080a09;
-                color: #4a5a4c;
-                border-top: 1px solid #1e2a1e;
-                font-size: 11px;
-            }
-        )");
-    }
-
+    // ─────────────────────────────────────────────────────────────────────────────
     void buildUi() {
         auto *root = new QWidget(this);
         setCentralWidget(root);
         auto *rootH = new QHBoxLayout(root);
-        rootH->setContentsMargins(0, 0, 0, 0);
-        rootH->setSpacing(0);
+        rootH->setContentsMargins(4, 4, 4, 4);
+        rootH->setSpacing(6);
 
-        // ── Left panel ─────────────────────────────────────────────────────
+        // ── Left panel: device list ───────────────────────────────────────
         auto *leftPanel = new QWidget;
-        leftPanel->setObjectName("leftPanel");
-        leftPanel->setFixedWidth(260);
+        leftPanel->setFixedWidth(240);
         auto *leftV = new QVBoxLayout(leftPanel);
         leftV->setContentsMargins(0, 0, 0, 0);
-        leftV->setSpacing(0);
 
-        auto *panelTitle = new QLabel("DEVICES");
-        panelTitle->setObjectName("panelTitle");
-        leftV->addWidget(panelTitle);
-
+        leftV->addWidget(new QLabel("Bluetooth Devices"));
         m_deviceList = new QListWidget;
         leftV->addWidget(m_deviceList, 1);
 
-        // Scan / Connect / Disconnect buttons
-        auto *btnArea = new QWidget;
-        auto *btnV    = new QVBoxLayout(btnArea);
-        btnV->setContentsMargins(10, 8, 10, 10);
-        btnV->setSpacing(6);
-
-        m_scanBtn    = new QPushButton("[ SCAN ]");
-        m_connectBtn = new QPushButton("[ CONNECT ]");
-        m_disconnBtn = new QPushButton("[ DISCONNECT ]");
-
-        m_scanBtn->setObjectName("primaryBtn");
-        m_connectBtn->setObjectName("primaryBtn");
-        m_disconnBtn->setObjectName("dangerBtn");
-
+        m_scanBtn    = new QPushButton("Scan");
+        m_connectBtn = new QPushButton("Connect");
+        m_disconnBtn = new QPushButton("Disconnect");
         m_connectBtn->setEnabled(false);
         m_disconnBtn->setEnabled(false);
-
-        btnV->addWidget(m_scanBtn);
-        btnV->addWidget(m_connectBtn);
-        btnV->addWidget(m_disconnBtn);
-        leftV->addWidget(btnArea);
-
+        leftV->addWidget(m_scanBtn);
+        leftV->addWidget(m_connectBtn);
+        leftV->addWidget(m_disconnBtn);
         rootH->addWidget(leftPanel);
 
-        // ── Right panel: IO ────────────────────────────────────────────────
+        // ── Right panel: controls + data ────────────────────────────────
         auto *rightPanel = new QWidget;
         auto *rightV     = new QVBoxLayout(rightPanel);
-        rightV->setContentsMargins(12, 10, 12, 10);
-        rightV->setSpacing(8);
+        rightV->setContentsMargins(0, 0, 0, 0);
 
-        auto *rxTitle = new QLabel("RX — RECEIVE");
-        rxTitle->setObjectName("panelTitle");
-        rxTitle->setStyleSheet("color:#7ec87e; font-size:11px; font-weight:bold; letter-spacing:3px; padding:0;");
-        rightV->addWidget(rxTitle);
+        // ── Controls row ────────────────────────────────────────────────
+        auto *ctrlRow = new QHBoxLayout;
 
-        m_rxPane = new QTextEdit;
-        m_rxPane->setReadOnly(true);
-        m_rxPane->setPlaceholderText("// awaiting connection…");
-        rightV->addWidget(m_rxPane, 1);
+        // Aim group
+        auto *aimGroup = new QGroupBox("Aim (MSG_AIM)");
+        auto *aimGrid  = new QGridLayout(aimGroup);
+        aimGrid->addWidget(new QLabel("Heading:"), 0, 0);
+        m_headingSpin = new QDoubleSpinBox;
+        m_headingSpin->setRange(-180.0, 180.0);
+        m_headingSpin->setDecimals(1);
+        m_headingSpin->setSuffix("\xc2\xb0");  // degree sign UTF-8
+        aimGrid->addWidget(m_headingSpin, 0, 1);
+        aimGrid->addWidget(new QLabel("Elevation:"), 1, 0);
+        m_elevationSpin = new QDoubleSpinBox;
+        m_elevationSpin->setRange(-90.0, 90.0);
+        m_elevationSpin->setDecimals(1);
+        m_elevationSpin->setSuffix("\xc2\xb0");
+        aimGrid->addWidget(m_elevationSpin, 1, 1);
+        m_aimBtn = new QPushButton("Send Aim");
+        m_aimBtn->setEnabled(false);
+        aimGrid->addWidget(m_aimBtn, 2, 0, 1, 2);
+        ctrlRow->addWidget(aimGroup);
 
-        // TX row
-        auto *txRow = new QHBoxLayout;
-        auto *txLabel = new QLabel("TX ›");
-        txLabel->setStyleSheet("color:#e8b84b; font-weight:bold; padding-right:4px;");
-        m_txLine  = new QLineEdit;
-        m_txLine->setPlaceholderText("type to send… (Enter or Send)");
-        m_txLine->setEnabled(false);
-        m_sendBtn = new QPushButton("SEND");
-        m_sendBtn->setObjectName("primaryBtn");
-        m_sendBtn->setFixedWidth(70);
-        m_sendBtn->setEnabled(false);
+        // Arm group
+        auto *armGroup = new QGroupBox("Arm (MSG_ARM)");
+        auto *armV     = new QVBoxLayout(armGroup);
+        m_masterArmChk = new QCheckBox("Master Arm");
+        m_turretArmChk = new QCheckBox("Turret Arm");
+        m_gunArmChk    = new QCheckBox("Gun Arm");
+        m_applyArmBtn  = new QPushButton("Apply");
+        m_applyArmBtn->setEnabled(false);
+        armV->addWidget(m_masterArmChk);
+        armV->addWidget(m_turretArmChk);
+        armV->addWidget(m_gunArmChk);
+        armV->addWidget(m_applyArmBtn);
+        ctrlRow->addWidget(armGroup);
 
-        txRow->addWidget(txLabel);
-        txRow->addWidget(m_txLine, 1);
-        txRow->addWidget(m_sendBtn);
-        rightV->addLayout(txRow);
+        // Voltage + Fire group
+        auto *vfGroup = new QGroupBox("Voltage / Fire");
+        auto *vfGrid  = new QGridLayout(vfGroup);
+        vfGrid->addWidget(new QLabel("Voltage:"), 0, 0);
+        m_voltageSpin = new QDoubleSpinBox;
+        m_voltageSpin->setRange(0.0, 120.0);
+        m_voltageSpin->setDecimals(1);
+        m_voltageSpin->setSuffix(" V");
+        vfGrid->addWidget(m_voltageSpin, 0, 1);
+        m_setVoltageBtn = new QPushButton("Set Voltage (MSG_SET_VOLTAGE)");
+        m_setVoltageBtn->setEnabled(false);
+        vfGrid->addWidget(m_setVoltageBtn, 1, 0, 1, 2);
+        m_fireBtn = new QPushButton("FIRE (MSG_FIRE)");
+        m_fireBtn->setEnabled(false);
+        vfGrid->addWidget(m_fireBtn, 2, 0, 1, 2);
+        ctrlRow->addWidget(vfGroup);
+
+        // Ping
+        auto *miscGroup = new QGroupBox("Misc");
+        auto *miscV     = new QVBoxLayout(miscGroup);
+        m_pingBtn = new QPushButton("Ping (MSG_PING)");
+        m_pingBtn->setEnabled(false);
+        miscV->addWidget(m_pingBtn);
+        miscV->addStretch();
+        ctrlRow->addWidget(miscGroup);
+
+        rightV->addLayout(ctrlRow);
+
+        // ── Telemetry + State display row ──────────────────────────────
+        auto *infoRow = new QHBoxLayout;
+
+        auto *telGroup = new QGroupBox("Telemetry (MSG_TELEMETRY, 250ms)");
+        auto *telGrid  = new QGridLayout(telGroup);
+        auto addTelRow = [&](int row, const QString &lbl, QLabel *&out) {
+            telGrid->addWidget(new QLabel(lbl), row, 0);
+            out = new QLabel("--");
+            telGrid->addWidget(out, row, 1);
+        };
+        addTelRow(0, "Heading:",     m_telHeading);
+        addTelRow(1, "Elevation:",   m_telElevation);
+        addTelRow(2, "Motor A vel:", m_telAVel);
+        addTelRow(3, "Motor A acc:", m_telAAcc);
+        addTelRow(4, "Motor B vel:", m_telBVel);
+        addTelRow(5, "Motor B acc:", m_telBAcc);
+        infoRow->addWidget(telGroup);
+
+        auto *stateGroup = new QGroupBox("Device State (MSG_STATE)");
+        auto *stateGrid  = new QGridLayout(stateGroup);
+        stateGrid->addWidget(new QLabel("Armed:"),          0, 0);
+        m_stateFlags = new QLabel("--");
+        stateGrid->addWidget(m_stateFlags, 0, 1);
+        stateGrid->addWidget(new QLabel("Target voltage:"), 1, 0);
+        m_stateVoltage = new QLabel("--");
+        stateGrid->addWidget(m_stateVoltage, 1, 1);
+        stateGrid->addWidget(new QLabel("Total shots:"),    2, 0);
+        m_shotTotal = new QLabel("--");
+        stateGrid->addWidget(m_shotTotal, 2, 1);
+        stateGrid->setRowStretch(3, 1);
+        infoRow->addWidget(stateGroup);
+
+        rightV->addLayout(infoRow);
+
+        // ── Event log ──────────────────────────────────────────────────
+        rightV->addWidget(new QLabel("Event Log:"));
+        m_eventLog = new QTextEdit;
+        m_eventLog->setReadOnly(true);
+        rightV->addWidget(m_eventLog, 1);
 
         rootH->addWidget(rightPanel, 1);
 
-        // ── Status bar ─────────────────────────────────────────────────────
-        m_statusLabel = new QLabel("  ready — no device connected");
+        // Status bar
+        m_statusLabel = new QLabel("  ready");
         statusBar()->addWidget(m_statusLabel, 1);
-        statusBar()->setSizeGripEnabled(false);
 
-        // ── Signals ────────────────────────────────────────────────────────
-        connect(m_scanBtn,    &QPushButton::clicked, this, &MainWindow::startScan);
-        connect(m_connectBtn, &QPushButton::clicked, this, &MainWindow::connectSelected);
-        connect(m_disconnBtn, &QPushButton::clicked, this, &MainWindow::disconnectDevice);
-        connect(m_sendBtn,    &QPushButton::clicked, this, &MainWindow::sendTx);
-        connect(m_txLine, &QLineEdit::returnPressed,  this, &MainWindow::sendTx);
+        // ── Signals ──────────────────────────────────────────────────────────
+        connect(m_scanBtn,       &QPushButton::clicked, this, &MainWindow::startScan);
+        connect(m_connectBtn,    &QPushButton::clicked, this, &MainWindow::connectSelected);
+        connect(m_disconnBtn,    &QPushButton::clicked, this, &MainWindow::disconnectDevice);
+        connect(m_pingBtn,       &QPushButton::clicked, this, &MainWindow::onPing);
+        connect(m_aimBtn,        &QPushButton::clicked, this, &MainWindow::onAim);
+        connect(m_applyArmBtn,   &QPushButton::clicked, this, &MainWindow::onArm);
+        connect(m_setVoltageBtn, &QPushButton::clicked, this, &MainWindow::onSetVoltage);
+        connect(m_fireBtn,       &QPushButton::clicked, this, &MainWindow::onFire);
 
         connect(m_deviceList, &QListWidget::currentRowChanged, [this](int row) {
             m_connectBtn->setEnabled(row >= 0 && m_sock == INVALID_SOCKET);
         });
     }
 
-    // ── Scan ───────────────────────────────────────────────────────────────
+    // ── Scan ─────────────────────────────────────────────────────────────────────
     void startScan() {
         m_scanBtn->setEnabled(false);
         m_deviceList->clear();
         m_devices.clear();
-        setStatus("scanning… (≈5 s inquiry)");
+        setStatus("scanning…");
 
         auto *thread = new QThread(this);
         auto *worker = new ScanWorker;
         worker->moveToThread(thread);
-
-        connect(thread, &QThread::started,  worker, &ScanWorker::scan);
+        connect(thread, &QThread::started,       worker, &ScanWorker::scan);
         connect(worker, &ScanWorker::scanDone, this, [this, thread, worker](QList<BtDevice> devs) {
             m_devices = devs;
             m_deviceList->clear();
             for (const auto &d : devs) {
-                QString flags;
-                if (d.connected)     flags += " ●";
-                if (d.authenticated) flags += " 🔑";
-                QString label = QString("  %1\n  %2%3")
-                    .arg(d.name.isEmpty() ? "(unknown)" : d.name)
-                    .arg(d.addressStr)
-                    .arg(flags);
-                auto *item = new QListWidgetItem(label);
+                auto *item = new QListWidgetItem(
+                    QString("%1\n%2%3")
+                        .arg(d.name.isEmpty() ? "(unknown)" : d.name)
+                        .arg(d.addressStr)
+                        .arg(d.connected ? " [connected]" : ""));
                 m_deviceList->addItem(item);
             }
             setStatus(devs.isEmpty()
@@ -439,26 +521,23 @@ private:
             worker->deleteLater();
             thread->deleteLater();
         });
-
         thread->start();
     }
 
-    // ── Connect ────────────────────────────────────────────────────────────
+    // ── Connect ───────────────────────────────────────────────────────────────
     void connectSelected() {
         int row = m_deviceList->currentRow();
         if (row < 0 || row >= m_devices.size()) return;
-
         const BtDevice &dev = m_devices[row];
         setStatus(QString("connecting to %1…").arg(dev.name));
         m_connectBtn->setEnabled(false);
         m_scanBtn->setEnabled(false);
 
-        // Build RFCOMM socket address (channel 1 — SPP)
         SOCKADDR_BTH addr{};
-        addr.addressFamily = AF_BTH;
-        addr.btAddr        = dev.address;
+        addr.addressFamily  = AF_BTH;
+        addr.btAddr         = dev.address;
         addr.serviceClassId = RFCOMM_PROTOCOL_UUID;
-        addr.port           = BT_PORT_ANY;   // let stack pick channel via SDP
+        addr.port           = BT_PORT_ANY;
 
         SOCKET sock = socket(AF_BTH, SOCK_STREAM, BTHPROTO_RFCOMM);
         if (sock == INVALID_SOCKET) {
@@ -468,13 +547,11 @@ private:
             return;
         }
 
-        // connect() is blocking — run on a thread
         auto *thread = new QThread(this);
         connect(thread, &QThread::started, [=]() {
             int res = ::connect(sock,
                 reinterpret_cast<SOCKADDR*>(const_cast<SOCKADDR_BTH*>(&addr)),
                 sizeof(addr));
-            // emit result back on GUI thread
             QMetaObject::invokeMethod(this, [=]() {
                 thread->quit();
                 thread->deleteLater();
@@ -494,40 +571,27 @@ private:
     void onConnected(SOCKET sock, const QString &name) {
         m_sock = sock;
         setStatus("connected — " + name);
+        setControlsEnabled(true);
+        logEvent(QString("=== Connected to %1 ===").arg(name));
 
-        m_disconnBtn->setEnabled(true);
-        m_connectBtn->setEnabled(false);
-        m_scanBtn->setEnabled(false);
-        m_txLine->setEnabled(true);
-        m_sendBtn->setEnabled(true);
-        m_txLine->setFocus();
-
-        appendRx(QString("── connected to %1 ──\n").arg(name), "#e8b84b");
-
-        // Start IO worker
         m_ioThread = new QThread(this);
         m_ioWorker = new IoWorker(sock);
         m_ioWorker->moveToThread(m_ioThread);
 
-        connect(m_ioThread, &QThread::started, m_ioWorker, &IoWorker::run);
-        connect(m_ioWorker, &IoWorker::received, this, [this](QByteArray data) {
-            appendRx(QString::fromLocal8Bit(data), "#7ec87e");
-        });
-        connect(m_ioWorker, &IoWorker::disconnected, this, [this]() {
-            appendRx("── remote disconnected ──\n", "#c05050");
+        connect(m_ioThread, &QThread::started,           m_ioWorker, &IoWorker::run);
+        connect(m_ioWorker, &IoWorker::packetReceived,   this,       &MainWindow::handlePacket);
+        connect(m_ioWorker, &IoWorker::disconnected,     this,       [this]() {
+            logEvent("=== Remote disconnected ===");
             disconnectDevice();
         });
 
         m_ioThread->start();
     }
 
-    // ── Disconnect ─────────────────────────────────────────────────────────
+    // ── Disconnect ───────────────────────────────────────────────────────────
     void disconnectDevice() {
-        if (m_ioWorker) {
-            m_ioWorker->requestStop();
-        }
+        if (m_ioWorker) m_ioWorker->requestStop();
         if (m_ioThread) {
-            // shutdown the socket so recv() unblocks
             if (m_sock != INVALID_SOCKET) shutdown(m_sock, SD_BOTH);
             m_ioThread->quit();
             m_ioThread->wait(2000);
@@ -538,47 +602,151 @@ private:
             closesocket(m_sock);
             m_sock = INVALID_SOCKET;
         }
-
-        m_disconnBtn->setEnabled(false);
+        setControlsEnabled(false);
         m_connectBtn->setEnabled(m_deviceList->currentRow() >= 0);
         m_scanBtn->setEnabled(true);
-        m_txLine->setEnabled(false);
-        m_sendBtn->setEnabled(false);
         setStatus("disconnected — ready");
     }
 
-    // ── TX ─────────────────────────────────────────────────────────────────
-    void sendTx() {
-        QString text = m_txLine->text();
-        if (text.isEmpty() || !m_ioWorker) return;
+    void setControlsEnabled(bool en) {
+        m_disconnBtn->setEnabled(en);
+        m_scanBtn->setEnabled(!en);
+        m_pingBtn->setEnabled(en);
+        m_aimBtn->setEnabled(en);
+        m_applyArmBtn->setEnabled(en);
+        m_setVoltageBtn->setEnabled(en);
+        m_fireBtn->setEnabled(en);
+        if (!en) m_connectBtn->setEnabled(m_deviceList->currentRow() >= 0);
+    }
 
-        QByteArray data = text.toLocal8Bit();
-        data.append('\n');                  // most SPP devices expect newline
+    // ── Protocol send slots ────────────────────────────────────────────────
+    void onPing() {
+        if (!m_ioWorker) return;
+        logEvent("→ PING");
+        QMetaObject::invokeMethod(m_ioWorker, &IoWorker::sendPing, Qt::QueuedConnection);
+    }
 
-        // Echo locally
-        appendRx("› " + text + "\n", "#e8b84b");
-        m_txLine->clear();
-
-        // Route to IO worker (thread-safe via signal)
-        QMetaObject::invokeMethod(m_ioWorker, [this, data]() {
-            m_ioWorker->sendData(data);
+    void onAim() {
+        if (!m_ioWorker) return;
+        float h = static_cast<float>(m_headingSpin->value());
+        float e = static_cast<float>(m_elevationSpin->value());
+        logEvent(QString("→ AIM heading=%1 elevation=%2").arg(h, 0, 'f', 1).arg(e, 0, 'f', 1));
+        QMetaObject::invokeMethod(m_ioWorker, [this, h, e]() {
+            m_ioWorker->sendAim(h, e);
         }, Qt::QueuedConnection);
     }
 
-    // ── Helpers ────────────────────────────────────────────────────────────
-    void appendRx(const QString &text, const QString &color) {
-        // Move cursor to end, insert colored html
-        QTextCursor cursor = m_rxPane->textCursor();
-        cursor.movePosition(QTextCursor::End);
-        m_rxPane->setTextCursor(cursor);
+    void onArm() {
+        if (!m_ioWorker) return;
+        auto enc = [](bool v) -> uint8_t { return v ? ARM_TRUE : ARM_FALSE; };
+        uint8_t flags = static_cast<uint8_t>(
+            (enc(m_masterArmChk->isChecked()) << ARM_SHIFT_MASTER) |
+            (enc(m_turretArmChk->isChecked()) << ARM_SHIFT_TURRET) |
+            (enc(m_gunArmChk->isChecked())    << ARM_SHIFT_GUN));
+        logEvent(QString("→ ARM flags=0x%1 (master=%2 turret=%3 gun=%4)")
+            .arg(flags, 2, 16, QChar('0'))
+            .arg(m_masterArmChk->isChecked() ? 1 : 0)
+            .arg(m_turretArmChk->isChecked() ? 1 : 0)
+            .arg(m_gunArmChk->isChecked()    ? 1 : 0));
+        QMetaObject::invokeMethod(m_ioWorker, [this, flags]() {
+            m_ioWorker->sendArm(flags);
+        }, Qt::QueuedConnection);
+    }
 
-        QString html = QString("<span style=\"color:%1; white-space:pre;\">%2</span>")
-            .arg(color, text.toHtmlEscaped());
-        m_rxPane->insertHtml(html);
+    void onSetVoltage() {
+        if (!m_ioWorker) return;
+        float v = static_cast<float>(m_voltageSpin->value());
+        logEvent(QString("→ SET_VOLTAGE %1 V").arg(v, 0, 'f', 1));
+        QMetaObject::invokeMethod(m_ioWorker, [this, v]() {
+            m_ioWorker->sendSetVoltage(v);
+        }, Qt::QueuedConnection);
+    }
 
-        // Auto-scroll
-        m_rxPane->verticalScrollBar()->setValue(
-            m_rxPane->verticalScrollBar()->maximum());
+    void onFire() {
+        if (!m_ioWorker) return;
+        logEvent("→ FIRE");
+        QMetaObject::invokeMethod(m_ioWorker, &IoWorker::sendFire, Qt::QueuedConnection);
+    }
+
+    // ── Incoming packet handler (runs on GUI thread via queued signal) ────────
+    void handlePacket(uint8_t type, QByteArray payload) {
+        switch (type) {
+        case MSG_PONG:
+            logEvent("← PONG");
+            break;
+
+        case MSG_STATE: {
+            if (payload.size() < static_cast<int>(sizeof(PktState))) break;
+            PktState pkt;
+            memcpy(&pkt, payload.constData(), sizeof(pkt));
+
+            QStringList armed;
+            if (pkt.flags & STATE_MASTER_ARM) armed << "MASTER";
+            if (pkt.flags & STATE_TURRET_ARM) armed << "TURRET";
+            if (pkt.flags & STATE_GUN_ARM)    armed << "GUN";
+            QString armedStr = armed.isEmpty() ? "none" : armed.join(" ");
+
+            m_stateFlags->setText(armedStr);
+            m_stateVoltage->setText(QString("%1 V").arg(pkt.target_v, 0, 'f', 1));
+
+            // Sync arm checkboxes and voltage spinbox to device state
+            m_masterArmChk->setChecked(pkt.flags & STATE_MASTER_ARM);
+            m_turretArmChk->setChecked(pkt.flags & STATE_TURRET_ARM);
+            m_gunArmChk->setChecked(pkt.flags    & STATE_GUN_ARM);
+            m_voltageSpin->setValue(pkt.target_v);
+
+            logEvent(QString("← STATE arm=[%1] target_v=%2 V").arg(armedStr).arg(pkt.target_v, 0, 'f', 1));
+            break;
+        }
+
+        case MSG_TELEMETRY: {
+            if (payload.size() < static_cast<int>(sizeof(PktTelemetry))) break;
+            PktTelemetry pkt;
+            memcpy(&pkt, payload.constData(), sizeof(pkt));
+            m_telHeading->setText(QString("%1\xc2\xb0").arg(pkt.heading,   0, 'f', 2));
+            m_telElevation->setText(QString("%1\xc2\xb0").arg(pkt.elevation, 0, 'f', 2));
+            m_telAVel->setText(QString("%1").arg(pkt.motorA_vel, 0, 'f', 3));
+            m_telAAcc->setText(QString("%1").arg(pkt.motorA_acc, 0, 'f', 3));
+            m_telBVel->setText(QString("%1").arg(pkt.motorB_vel, 0, 'f', 3));
+            m_telBAcc->setText(QString("%1").arg(pkt.motorB_acc, 0, 'f', 3));
+            // Telemetry arrives at 4 Hz; don't spam the log
+            break;
+        }
+
+        case MSG_SHOT: {
+            if (payload.size() < static_cast<int>(sizeof(PktShotHeader))) break;
+            PktShotHeader hdr;
+            memcpy(&hdr, payload.constData(), sizeof(hdr));
+            m_shotTotal->setText(QString::number(hdr.total_shots));
+
+            QString msg = QString("← SHOT total=%1 stages=%2")
+                .arg(hdr.total_shots).arg(hdr.stage_count);
+            int offset = static_cast<int>(sizeof(PktShotHeader));
+            for (uint8_t i = 0; i < hdr.stage_count; ++i, offset += 12) {
+                if (offset + 12 > payload.size()) break;
+                PktShotStage stage;
+                memcpy(&stage, payload.constData() + offset, sizeof(stage));
+                msg += QString("\n  [%1] t=%2 us  v=%3 m/s  drain=%4 V")
+                    .arg(i).arg(stage.t_us)
+                    .arg(stage.v_mps,  0, 'f', 2)
+                    .arg(stage.drain_v, 0, 'f', 2);
+            }
+            logEvent(msg);
+            break;
+        }
+
+        default:
+            logEvent(QString("← unknown type 0x%1 (%2 bytes)")
+                .arg(type, 2, 16, QChar('0')).arg(payload.size()));
+            break;
+        }
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────────
+    void logEvent(const QString &msg) {
+        m_eventLog->append(msg);
+        m_eventLog->verticalScrollBar()->setValue(
+            m_eventLog->verticalScrollBar()->maximum());
     }
 
     void setStatus(const QString &msg) {

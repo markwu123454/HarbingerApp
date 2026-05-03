@@ -13,7 +13,6 @@
 #include <QGroupBox>
 #include <QStatusBar>
 #include <QThread>
-#include <QTimer>
 #include <QScrollBar>
 #include <QMessageBox>
 
@@ -34,33 +33,25 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // Protocol constants (mirrors Harbinger proto.h)
 // ─────────────────────────────────────────────────────────────────────────────
-
-// Host → Device
 constexpr uint8_t MSG_PING        = 0x01;
 constexpr uint8_t MSG_AIM         = 0x02;
 constexpr uint8_t MSG_ARM         = 0x03;
 constexpr uint8_t MSG_SET_VOLTAGE = 0x04;
 constexpr uint8_t MSG_FIRE        = 0x05;
-
-// Device → Host
 constexpr uint8_t MSG_PONG        = 0x81;
 constexpr uint8_t MSG_STATE       = 0x82;
 constexpr uint8_t MSG_TELEMETRY   = 0x83;
 constexpr uint8_t MSG_SHOT        = 0x84;
 
-// ARM flags (2 bits per field; 0x01=false, 0x02=true, 0x00=no-change)
 constexpr uint8_t ARM_SHIFT_MASTER = 0;
 constexpr uint8_t ARM_SHIFT_TURRET = 2;
 constexpr uint8_t ARM_SHIFT_GUN    = 4;
 constexpr uint8_t ARM_FALSE        = 0x01;
 constexpr uint8_t ARM_TRUE         = 0x02;
-
-// STATE flags
 constexpr uint8_t STATE_MASTER_ARM = 0x01;
 constexpr uint8_t STATE_TURRET_ARM = 0x02;
 constexpr uint8_t STATE_GUN_ARM    = 0x04;
 
-// Packed message structs
 #pragma pack(push, 1)
 struct PktAim        { float heading; float elevation; };
 struct PktArm        { uint8_t flags; };
@@ -84,26 +75,21 @@ struct BtDevice {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Worker: scans for Bluetooth devices on a background thread
-// ─────────────────────────────────────────────────────────────────────────────
 class ScanWorker : public QObject {
     Q_OBJECT
 public slots:
     void scan() {
         QList<BtDevice> found;
-
         BLUETOOTH_DEVICE_SEARCH_PARAMS params{};
         params.dwSize               = sizeof(params);
         params.fReturnAuthenticated = TRUE;
         params.fReturnRemembered    = TRUE;
         params.fReturnUnknown       = TRUE;
         params.fReturnConnected     = TRUE;
-        params.fIssueInquiry        = FALSE;
-        params.cTimeoutMultiplier   = 0;
-
+        params.fIssueInquiry        = TRUE;
+        params.cTimeoutMultiplier   = 4;
         BLUETOOTH_DEVICE_INFO info{};
         info.dwSize = sizeof(info);
-
         HBLUETOOTH_DEVICE_FIND hFind = BluetoothFindFirstDevice(&params, &info);
         if (hFind) {
             do {
@@ -113,7 +99,6 @@ public slots:
                 dev.authenticated = info.fAuthenticated;
                 dev.remembered    = info.fRemembered;
                 dev.connected     = info.fConnected;
-
                 BTH_ADDR a = info.Address.ullLong;
                 dev.addressStr = QString("%1:%2:%3:%4:%5:%6")
                     .arg((a >> 40) & 0xFF, 2, 16, QChar('0'))
@@ -134,8 +119,9 @@ signals:
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Worker: owns the SOCKET, runs binary protocol RX parser on background thread,
-// and provides typed send methods invokable from any thread.
+// IoWorker: owns the socket, runs binary RX parser on the IO thread.
+// Send methods are called DIRECTLY from the main thread — send() is
+// thread-safe alongside a concurrent blocking recv() in another thread.
 // ─────────────────────────────────────────────────────────────────────────────
 class IoWorker : public QObject {
     Q_OBJECT
@@ -144,7 +130,32 @@ public:
 
     void requestStop() { m_stop = true; }
 
+    // Called directly from the main thread — send() is thread-safe.
+    void sendPing() {
+        uint8_t b = MSG_PING;
+        rawSend(&b, 1);
+    }
+    void sendAim(float heading, float elevation) {
+        PktAim pkt { heading, elevation };
+        msgSend(MSG_AIM, &pkt, sizeof(pkt));
+    }
+    void sendArm(uint8_t flags) {
+        PktArm pkt { flags };
+        msgSend(MSG_ARM, &pkt, sizeof(pkt));
+    }
+    void sendSetVoltage(float voltage) {
+        PktSetVoltage pkt { voltage };
+        msgSend(MSG_SET_VOLTAGE, &pkt, sizeof(pkt));
+    }
+    void sendFire() {
+        uint8_t b = MSG_FIRE;
+        rawSend(&b, 1);
+    }
+
 public slots:
+    // Runs on the IO thread; blocks in recv(). Because this never returns,
+    // the thread's event loop never starts — so sends must NOT use
+    // invokeMethod/QueuedConnection to this object.
     void run() {
         uint8_t buf[512];
         while (!m_stop) {
@@ -159,31 +170,6 @@ public slots:
         }
     }
 
-    void sendPing() {
-        uint8_t b = MSG_PING;
-        sendRaw(&b, 1);
-    }
-
-    void sendAim(float heading, float elevation) {
-        PktAim pkt { heading, elevation };
-        sendMsg(MSG_AIM, &pkt, sizeof(pkt));
-    }
-
-    void sendArm(uint8_t flags) {
-        PktArm pkt { flags };
-        sendMsg(MSG_ARM, &pkt, sizeof(pkt));
-    }
-
-    void sendSetVoltage(float voltage) {
-        PktSetVoltage pkt { voltage };
-        sendMsg(MSG_SET_VOLTAGE, &pkt, sizeof(pkt));
-    }
-
-    void sendFire() {
-        uint8_t b = MSG_FIRE;
-        sendRaw(&b, 1);
-    }
-
 signals:
     void packetReceived(uint8_t type, QByteArray payload);
     void disconnected();
@@ -192,7 +178,6 @@ private:
     SOCKET            m_sock = INVALID_SOCKET;
     std::atomic<bool> m_stop{false};
 
-    // RX state machine (mirrors btTask.cpp parser)
     enum class RxState { TYPE, PAYLOAD, SHOT_STAGES };
     RxState    m_rxState    = RxState::TYPE;
     uint8_t    m_rxType     = 0;
@@ -201,23 +186,23 @@ private:
 
     void feedByte(uint8_t b) {
         switch (m_rxState) {
-        case RxState::TYPE: {
+        case RxState::TYPE:
             m_rxType = b;
             m_rxBuf.clear();
-            size_t psiz = payloadSize(b);
-            if (psiz == SIZE_MAX) break; // unknown type, skip
-            if (b == MSG_SHOT) {
-                // read 5-byte header first (uint32_t total + uint8_t count)
-                m_rxExpected = 5;
-                m_rxState = RxState::PAYLOAD;
-            } else if (psiz == 0) {
-                emit packetReceived(b, QByteArray());
-            } else {
-                m_rxExpected = psiz;
-                m_rxState = RxState::PAYLOAD;
+            {
+                size_t psiz = payloadSize(b);
+                if (psiz == SIZE_MAX) break;
+                if (b == MSG_SHOT) {
+                    m_rxExpected = 5;
+                    m_rxState = RxState::PAYLOAD;
+                } else if (psiz == 0) {
+                    emit packetReceived(b, QByteArray());
+                } else {
+                    m_rxExpected = psiz;
+                    m_rxState = RxState::PAYLOAD;
+                }
             }
             break;
-        }
         case RxState::PAYLOAD:
             m_rxBuf.append(static_cast<char>(b));
             if (static_cast<size_t>(m_rxBuf.size()) >= m_rxExpected) {
@@ -228,7 +213,6 @@ private:
                         emit packetReceived(MSG_SHOT, m_rxBuf);
                         m_rxState = RxState::TYPE;
                     } else {
-                        // accumulate stage_count * 12 more bytes
                         m_rxExpected = 5 + static_cast<size_t>(hdr.stage_count) * 12;
                         m_rxState = RxState::SHOT_STAGES;
                     }
@@ -251,27 +235,24 @@ private:
     static size_t payloadSize(uint8_t type) {
         switch (type) {
         case MSG_PONG:      return 0;
-        case MSG_STATE:     return 5;  // uint8_t + float32
-        case MSG_TELEMETRY: return 24; // 6 * float32
-        case MSG_SHOT:      return 5;  // header (resolved to variable in feedByte)
+        case MSG_STATE:     return 5;
+        case MSG_TELEMETRY: return 24;
+        case MSG_SHOT:      return 5;
         default:            return SIZE_MAX;
         }
     }
 
-    void sendRaw(const uint8_t* data, size_t len) {
+    void rawSend(const uint8_t* data, size_t len) {
         if (m_sock != INVALID_SOCKET)
             send(m_sock, reinterpret_cast<const char*>(data), static_cast<int>(len), 0);
     }
-
-    void sendMsg(uint8_t type, const void* payload, size_t len) {
-        sendRaw(&type, 1);
+    void msgSend(uint8_t type, const void* payload, size_t len) {
+        rawSend(&type, 1);
         if (payload && len > 0)
-            sendRaw(static_cast<const uint8_t*>(payload), len);
+            rawSend(static_cast<const uint8_t*>(payload), len);
     }
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Main Window
 // ─────────────────────────────────────────────────────────────────────────────
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -287,21 +268,15 @@ public:
         setMinimumSize(960, 640);
         buildUi();
     }
-
-    ~MainWindow() override {
-        disconnectDevice();
-        WSACleanup();
-    }
+    ~MainWindow() override { disconnectDevice(); WSACleanup(); }
 
 private:
-    // ── Device list UI ───────────────────────────────────────────────────
-    QListWidget *m_deviceList = nullptr;
-    QPushButton *m_scanBtn    = nullptr;
-    QPushButton *m_connectBtn = nullptr;
-    QPushButton *m_disconnBtn = nullptr;
-    QLabel      *m_statusLabel = nullptr;
+    QListWidget    *m_deviceList   = nullptr;
+    QPushButton    *m_scanBtn      = nullptr;
+    QPushButton    *m_connectBtn   = nullptr;
+    QPushButton    *m_disconnBtn   = nullptr;
+    QLabel         *m_statusLabel  = nullptr;
 
-    // ── Command controls ───────────────────────────────────────────────
     QDoubleSpinBox *m_headingSpin   = nullptr;
     QDoubleSpinBox *m_elevationSpin = nullptr;
     QPushButton    *m_aimBtn        = nullptr;
@@ -314,42 +289,37 @@ private:
     QPushButton    *m_fireBtn       = nullptr;
     QPushButton    *m_pingBtn       = nullptr;
 
-    // ── Telemetry / state display ────────────────────────────────────────
-    QLabel *m_telHeading   = nullptr;
-    QLabel *m_telElevation = nullptr;
-    QLabel *m_telAVel      = nullptr;
-    QLabel *m_telAAcc      = nullptr;
-    QLabel *m_telBVel      = nullptr;
-    QLabel *m_telBAcc      = nullptr;
-    QLabel *m_stateFlags   = nullptr;
-    QLabel *m_stateVoltage = nullptr;
-    QLabel *m_shotTotal    = nullptr;
-    QTextEdit *m_eventLog  = nullptr;
+    QLabel    *m_telHeading   = nullptr;
+    QLabel    *m_telElevation = nullptr;
+    QLabel    *m_telAVel      = nullptr;
+    QLabel    *m_telAAcc      = nullptr;
+    QLabel    *m_telBVel      = nullptr;
+    QLabel    *m_telBAcc      = nullptr;
+    QLabel    *m_stateFlags   = nullptr;
+    QLabel    *m_stateVoltage = nullptr;
+    QLabel    *m_shotTotal    = nullptr;
+    QTextEdit *m_eventLog     = nullptr;
 
-    // ── Connection state ───────────────────────────────────────────────
     QList<BtDevice> m_devices;
     SOCKET          m_sock     = INVALID_SOCKET;
     QThread        *m_ioThread = nullptr;
     IoWorker       *m_ioWorker = nullptr;
 
-    // ─────────────────────────────────────────────────────────────────────────────
     void buildUi() {
-        auto *root = new QWidget(this);
+        auto *root  = new QWidget(this);
         setCentralWidget(root);
         auto *rootH = new QHBoxLayout(root);
         rootH->setContentsMargins(4, 4, 4, 4);
         rootH->setSpacing(6);
 
-        // ── Left panel: device list ───────────────────────────────────────
+        // Left: device list
         auto *leftPanel = new QWidget;
         leftPanel->setFixedWidth(240);
         auto *leftV = new QVBoxLayout(leftPanel);
         leftV->setContentsMargins(0, 0, 0, 0);
-
         leftV->addWidget(new QLabel("Bluetooth Devices"));
         m_deviceList = new QListWidget;
         leftV->addWidget(m_deviceList, 1);
-
         m_scanBtn    = new QPushButton("Scan");
         m_connectBtn = new QPushButton("Connect");
         m_disconnBtn = new QPushButton("Disconnect");
@@ -360,22 +330,20 @@ private:
         leftV->addWidget(m_disconnBtn);
         rootH->addWidget(leftPanel);
 
-        // ── Right panel: controls + data ────────────────────────────────
+        // Right: controls + data
         auto *rightPanel = new QWidget;
         auto *rightV     = new QVBoxLayout(rightPanel);
         rightV->setContentsMargins(0, 0, 0, 0);
 
-        // ── Controls row ────────────────────────────────────────────────
         auto *ctrlRow = new QHBoxLayout;
 
-        // Aim group
         auto *aimGroup = new QGroupBox("Aim (MSG_AIM)");
         auto *aimGrid  = new QGridLayout(aimGroup);
         aimGrid->addWidget(new QLabel("Heading:"), 0, 0);
         m_headingSpin = new QDoubleSpinBox;
         m_headingSpin->setRange(-180.0, 180.0);
         m_headingSpin->setDecimals(1);
-        m_headingSpin->setSuffix("\xc2\xb0");  // degree sign UTF-8
+        m_headingSpin->setSuffix("\xc2\xb0");
         aimGrid->addWidget(m_headingSpin, 0, 1);
         aimGrid->addWidget(new QLabel("Elevation:"), 1, 0);
         m_elevationSpin = new QDoubleSpinBox;
@@ -388,7 +356,6 @@ private:
         aimGrid->addWidget(m_aimBtn, 2, 0, 1, 2);
         ctrlRow->addWidget(aimGroup);
 
-        // Arm group
         auto *armGroup = new QGroupBox("Arm (MSG_ARM)");
         auto *armV     = new QVBoxLayout(armGroup);
         m_masterArmChk = new QCheckBox("Master Arm");
@@ -402,7 +369,6 @@ private:
         armV->addWidget(m_applyArmBtn);
         ctrlRow->addWidget(armGroup);
 
-        // Voltage + Fire group
         auto *vfGroup = new QGroupBox("Voltage / Fire");
         auto *vfGrid  = new QGridLayout(vfGroup);
         vfGrid->addWidget(new QLabel("Voltage:"), 0, 0);
@@ -419,7 +385,6 @@ private:
         vfGrid->addWidget(m_fireBtn, 2, 0, 1, 2);
         ctrlRow->addWidget(vfGroup);
 
-        // Ping
         auto *miscGroup = new QGroupBox("Misc");
         auto *miscV     = new QVBoxLayout(miscGroup);
         m_pingBtn = new QPushButton("Ping (MSG_PING)");
@@ -430,8 +395,7 @@ private:
 
         rightV->addLayout(ctrlRow);
 
-        // ── Telemetry + State display row ──────────────────────────────
-        auto *infoRow = new QHBoxLayout;
+        auto *infoRow  = new QHBoxLayout;
 
         auto *telGroup = new QGroupBox("Telemetry (MSG_TELEMETRY, 250ms)");
         auto *telGrid  = new QGridLayout(telGroup);
@@ -464,7 +428,6 @@ private:
 
         rightV->addLayout(infoRow);
 
-        // ── Event log ──────────────────────────────────────────────────
         rightV->addWidget(new QLabel("Event Log:"));
         m_eventLog = new QTextEdit;
         m_eventLog->setReadOnly(true);
@@ -472,11 +435,9 @@ private:
 
         rootH->addWidget(rightPanel, 1);
 
-        // Status bar
         m_statusLabel = new QLabel("  ready");
         statusBar()->addWidget(m_statusLabel, 1);
 
-        // ── Signals ──────────────────────────────────────────────────────────
         connect(m_scanBtn,       &QPushButton::clicked, this, &MainWindow::startScan);
         connect(m_connectBtn,    &QPushButton::clicked, this, &MainWindow::connectSelected);
         connect(m_disconnBtn,    &QPushButton::clicked, this, &MainWindow::disconnectDevice);
@@ -485,51 +446,44 @@ private:
         connect(m_applyArmBtn,   &QPushButton::clicked, this, &MainWindow::onArm);
         connect(m_setVoltageBtn, &QPushButton::clicked, this, &MainWindow::onSetVoltage);
         connect(m_fireBtn,       &QPushButton::clicked, this, &MainWindow::onFire);
-
         connect(m_deviceList, &QListWidget::currentRowChanged, [this](int row) {
             m_connectBtn->setEnabled(row >= 0 && m_sock == INVALID_SOCKET);
         });
     }
 
-    // ── Scan ─────────────────────────────────────────────────────────────────────
     void startScan() {
         m_scanBtn->setEnabled(false);
         m_deviceList->clear();
         m_devices.clear();
-        setStatus("scanning…");
-
+        setStatus("scanning\xe2\x80\xa6 (\xe2\x89\x885 s)");
         auto *thread = new QThread(this);
         auto *worker = new ScanWorker;
         worker->moveToThread(thread);
-        connect(thread, &QThread::started,       worker, &ScanWorker::scan);
+        connect(thread, &QThread::started, worker, &ScanWorker::scan);
         connect(worker, &ScanWorker::scanDone, this, [this, thread, worker](QList<BtDevice> devs) {
             m_devices = devs;
             m_deviceList->clear();
             for (const auto &d : devs) {
-                auto *item = new QListWidgetItem(
+                m_deviceList->addItem(new QListWidgetItem(
                     QString("%1\n%2%3")
                         .arg(d.name.isEmpty() ? "(unknown)" : d.name)
                         .arg(d.addressStr)
-                        .arg(d.connected ? " [connected]" : ""));
-                m_deviceList->addItem(item);
+                        .arg(d.connected ? " [connected]" : "")));
             }
             setStatus(devs.isEmpty()
-                ? "scan complete — no devices found"
-                : QString("scan complete — %1 device(s)").arg(devs.size()));
+                ? "scan complete \xe2\x80\x94 no devices found"
+                : QString("scan complete \xe2\x80\x94 %1 device(s)").arg(devs.size()));
             m_scanBtn->setEnabled(true);
-            thread->quit();
-            worker->deleteLater();
-            thread->deleteLater();
+            thread->quit(); worker->deleteLater(); thread->deleteLater();
         });
         thread->start();
     }
 
-    // ── Connect ───────────────────────────────────────────────────────────────
     void connectSelected() {
         int row = m_deviceList->currentRow();
         if (row < 0 || row >= m_devices.size()) return;
         const BtDevice &dev = m_devices[row];
-        setStatus(QString("connecting to %1…").arg(dev.name));
+        setStatus(QString("connecting to %1\xe2\x80\xa6").arg(dev.name));
         m_connectBtn->setEnabled(false);
         m_scanBtn->setEnabled(false);
 
@@ -542,24 +496,19 @@ private:
         SOCKET sock = socket(AF_BTH, SOCK_STREAM, BTHPROTO_RFCOMM);
         if (sock == INVALID_SOCKET) {
             setStatus("socket() failed: " + QString::number(WSAGetLastError()));
-            m_connectBtn->setEnabled(true);
-            m_scanBtn->setEnabled(true);
+            m_connectBtn->setEnabled(true); m_scanBtn->setEnabled(true);
             return;
         }
-
         auto *thread = new QThread(this);
         connect(thread, &QThread::started, [=]() {
             int res = ::connect(sock,
-                reinterpret_cast<SOCKADDR*>(const_cast<SOCKADDR_BTH*>(&addr)),
-                sizeof(addr));
+                reinterpret_cast<SOCKADDR*>(const_cast<SOCKADDR_BTH*>(&addr)), sizeof(addr));
             QMetaObject::invokeMethod(this, [=]() {
-                thread->quit();
-                thread->deleteLater();
+                thread->quit(); thread->deleteLater();
                 if (res == SOCKET_ERROR) {
                     setStatus("connect() failed: " + QString::number(WSAGetLastError()));
                     closesocket(sock);
-                    m_connectBtn->setEnabled(true);
-                    m_scanBtn->setEnabled(true);
+                    m_connectBtn->setEnabled(true); m_scanBtn->setEnabled(true);
                 } else {
                     onConnected(sock, dev.name);
                 }
@@ -570,7 +519,7 @@ private:
 
     void onConnected(SOCKET sock, const QString &name) {
         m_sock = sock;
-        setStatus("connected — " + name);
+        setStatus("connected \xe2\x80\x94 " + name);
         setControlsEnabled(true);
         logEvent(QString("=== Connected to %1 ===").arg(name));
 
@@ -578,34 +527,29 @@ private:
         m_ioWorker = new IoWorker(sock);
         m_ioWorker->moveToThread(m_ioThread);
 
-        connect(m_ioThread, &QThread::started,           m_ioWorker, &IoWorker::run);
-        connect(m_ioWorker, &IoWorker::packetReceived,   this,       &MainWindow::handlePacket);
-        connect(m_ioWorker, &IoWorker::disconnected,     this,       [this]() {
+        connect(m_ioThread, &QThread::started,         m_ioWorker, &IoWorker::run);
+        connect(m_ioWorker, &IoWorker::packetReceived, this,       &MainWindow::handlePacket);
+        connect(m_ioWorker, &IoWorker::disconnected,   this,       [this]() {
             logEvent("=== Remote disconnected ===");
             disconnectDevice();
         });
-
         m_ioThread->start();
     }
 
-    // ── Disconnect ───────────────────────────────────────────────────────────
     void disconnectDevice() {
         if (m_ioWorker) m_ioWorker->requestStop();
         if (m_ioThread) {
             if (m_sock != INVALID_SOCKET) shutdown(m_sock, SD_BOTH);
             m_ioThread->quit();
             m_ioThread->wait(2000);
-            delete m_ioWorker;  m_ioWorker = nullptr;
-            delete m_ioThread;  m_ioThread = nullptr;
+            delete m_ioWorker; m_ioWorker = nullptr;
+            delete m_ioThread; m_ioThread = nullptr;
         }
-        if (m_sock != INVALID_SOCKET) {
-            closesocket(m_sock);
-            m_sock = INVALID_SOCKET;
-        }
+        if (m_sock != INVALID_SOCKET) { closesocket(m_sock); m_sock = INVALID_SOCKET; }
         setControlsEnabled(false);
         m_connectBtn->setEnabled(m_deviceList->currentRow() >= 0);
         m_scanBtn->setEnabled(true);
-        setStatus("disconnected — ready");
+        setStatus("disconnected \xe2\x80\x94 ready");
     }
 
     void setControlsEnabled(bool en) {
@@ -619,23 +563,19 @@ private:
         if (!en) m_connectBtn->setEnabled(m_deviceList->currentRow() >= 0);
     }
 
-    // ── Protocol send slots ────────────────────────────────────────────────
+    // ── Send: called directly from main thread (send() is thread-safe) ─────────
     void onPing() {
         if (!m_ioWorker) return;
-        logEvent("→ PING");
-        QMetaObject::invokeMethod(m_ioWorker, &IoWorker::sendPing, Qt::QueuedConnection);
+        logEvent("\xe2\x86\x92 PING");
+        m_ioWorker->sendPing();
     }
-
     void onAim() {
         if (!m_ioWorker) return;
         float h = static_cast<float>(m_headingSpin->value());
         float e = static_cast<float>(m_elevationSpin->value());
-        logEvent(QString("→ AIM heading=%1 elevation=%2").arg(h, 0, 'f', 1).arg(e, 0, 'f', 1));
-        QMetaObject::invokeMethod(m_ioWorker, [this, h, e]() {
-            m_ioWorker->sendAim(h, e);
-        }, Qt::QueuedConnection);
+        logEvent(QString("\xe2\x86\x92 AIM heading=%1 elevation=%2").arg(h,0,'f',1).arg(e,0,'f',1));
+        m_ioWorker->sendAim(h, e);
     }
-
     void onArm() {
         if (!m_ioWorker) return;
         auto enc = [](bool v) -> uint8_t { return v ? ARM_TRUE : ARM_FALSE; };
@@ -643,59 +583,48 @@ private:
             (enc(m_masterArmChk->isChecked()) << ARM_SHIFT_MASTER) |
             (enc(m_turretArmChk->isChecked()) << ARM_SHIFT_TURRET) |
             (enc(m_gunArmChk->isChecked())    << ARM_SHIFT_GUN));
-        logEvent(QString("→ ARM flags=0x%1 (master=%2 turret=%3 gun=%4)")
+        logEvent(QString("\xe2\x86\x92 ARM flags=0x%1 (master=%2 turret=%3 gun=%4)")
             .arg(flags, 2, 16, QChar('0'))
             .arg(m_masterArmChk->isChecked() ? 1 : 0)
             .arg(m_turretArmChk->isChecked() ? 1 : 0)
             .arg(m_gunArmChk->isChecked()    ? 1 : 0));
-        QMetaObject::invokeMethod(m_ioWorker, [this, flags]() {
-            m_ioWorker->sendArm(flags);
-        }, Qt::QueuedConnection);
+        m_ioWorker->sendArm(flags);
     }
-
     void onSetVoltage() {
         if (!m_ioWorker) return;
         float v = static_cast<float>(m_voltageSpin->value());
-        logEvent(QString("→ SET_VOLTAGE %1 V").arg(v, 0, 'f', 1));
-        QMetaObject::invokeMethod(m_ioWorker, [this, v]() {
-            m_ioWorker->sendSetVoltage(v);
-        }, Qt::QueuedConnection);
+        logEvent(QString("\xe2\x86\x92 SET_VOLTAGE %1 V").arg(v, 0, 'f', 1));
+        m_ioWorker->sendSetVoltage(v);
     }
-
     void onFire() {
         if (!m_ioWorker) return;
-        logEvent("→ FIRE");
-        QMetaObject::invokeMethod(m_ioWorker, &IoWorker::sendFire, Qt::QueuedConnection);
+        logEvent("\xe2\x86\x92 FIRE");
+        m_ioWorker->sendFire();
     }
 
-    // ── Incoming packet handler (runs on GUI thread via queued signal) ────────
+    // ── Receive: called on main thread via queued signal ──────────────────────
     void handlePacket(uint8_t type, QByteArray payload) {
         switch (type) {
         case MSG_PONG:
-            logEvent("← PONG");
+            logEvent("\xe2\x86\x90 PONG");
             break;
 
         case MSG_STATE: {
             if (payload.size() < static_cast<int>(sizeof(PktState))) break;
             PktState pkt;
             memcpy(&pkt, payload.constData(), sizeof(pkt));
-
             QStringList armed;
             if (pkt.flags & STATE_MASTER_ARM) armed << "MASTER";
             if (pkt.flags & STATE_TURRET_ARM) armed << "TURRET";
             if (pkt.flags & STATE_GUN_ARM)    armed << "GUN";
             QString armedStr = armed.isEmpty() ? "none" : armed.join(" ");
-
             m_stateFlags->setText(armedStr);
             m_stateVoltage->setText(QString("%1 V").arg(pkt.target_v, 0, 'f', 1));
-
-            // Sync arm checkboxes and voltage spinbox to device state
             m_masterArmChk->setChecked(pkt.flags & STATE_MASTER_ARM);
             m_turretArmChk->setChecked(pkt.flags & STATE_TURRET_ARM);
             m_gunArmChk->setChecked(pkt.flags    & STATE_GUN_ARM);
             m_voltageSpin->setValue(pkt.target_v);
-
-            logEvent(QString("← STATE arm=[%1] target_v=%2 V").arg(armedStr).arg(pkt.target_v, 0, 'f', 1));
+            logEvent(QString("\xe2\x86\x90 STATE arm=[%1] target_v=%2 V").arg(armedStr).arg(pkt.target_v,0,'f',1));
             break;
         }
 
@@ -709,7 +638,12 @@ private:
             m_telAAcc->setText(QString("%1").arg(pkt.motorA_acc, 0, 'f', 3));
             m_telBVel->setText(QString("%1").arg(pkt.motorB_vel, 0, 'f', 3));
             m_telBAcc->setText(QString("%1").arg(pkt.motorB_acc, 0, 'f', 3));
-            // Telemetry arrives at 4 Hz; don't spam the log
+            // Log briefly so it's visible; suppress repeating identical lines
+            QString telLine = QString("\xe2\x86\x90 TEL h=%1 e=%2 Avel=%3 Bvel=%4")
+                .arg(pkt.heading,   0, 'f', 1).arg(pkt.elevation, 0, 'f', 1)
+                .arg(pkt.motorA_vel, 0, 'f', 2).arg(pkt.motorB_vel, 0, 'f', 2);
+            static QString lastTelLine;
+            if (telLine != lastTelLine) { logEvent(telLine); lastTelLine = telLine; }
             break;
         }
 
@@ -718,43 +652,32 @@ private:
             PktShotHeader hdr;
             memcpy(&hdr, payload.constData(), sizeof(hdr));
             m_shotTotal->setText(QString::number(hdr.total_shots));
-
-            QString msg = QString("← SHOT total=%1 stages=%2")
-                .arg(hdr.total_shots).arg(hdr.stage_count);
+            QString msg = QString("\xe2\x86\x90 SHOT total=%1 stages=%2").arg(hdr.total_shots).arg(hdr.stage_count);
             int offset = static_cast<int>(sizeof(PktShotHeader));
             for (uint8_t i = 0; i < hdr.stage_count; ++i, offset += 12) {
                 if (offset + 12 > payload.size()) break;
                 PktShotStage stage;
                 memcpy(&stage, payload.constData() + offset, sizeof(stage));
-                msg += QString("\n  [%1] t=%2 us  v=%3 m/s  drain=%4 V")
-                    .arg(i).arg(stage.t_us)
-                    .arg(stage.v_mps,  0, 'f', 2)
-                    .arg(stage.drain_v, 0, 'f', 2);
+                msg += QString("\n  [%1] t=%2us v=%3m/s drain=%4V")
+                    .arg(i).arg(stage.t_us).arg(stage.v_mps,0,'f',2).arg(stage.drain_v,0,'f',2);
             }
             logEvent(msg);
             break;
         }
 
         default:
-            logEvent(QString("← unknown type 0x%1 (%2 bytes)")
-                .arg(type, 2, 16, QChar('0')).arg(payload.size()));
+            logEvent(QString("\xe2\x86\x90 unknown 0x%1 (%2 B)").arg(type,2,16,QChar('0')).arg(payload.size()));
             break;
         }
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────────
     void logEvent(const QString &msg) {
         m_eventLog->append(msg);
-        m_eventLog->verticalScrollBar()->setValue(
-            m_eventLog->verticalScrollBar()->maximum());
+        m_eventLog->verticalScrollBar()->setValue(m_eventLog->verticalScrollBar()->maximum());
     }
-
-    void setStatus(const QString &msg) {
-        m_statusLabel->setText("  " + msg);
-    }
+    void setStatus(const QString &msg) { m_statusLabel->setText("  " + msg); }
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
 int main(int argc, char *argv[]) {
     QApplication app(argc, argv);
     MainWindow win;

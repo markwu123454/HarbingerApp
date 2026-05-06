@@ -20,6 +20,7 @@ public:
     explicit AimWidget(QWidget *parent = nullptr) : QWidget(parent) {
         setMinimumSize(200, 200);
         setFocusPolicy(Qt::StrongFocus);
+        setMouseTracking(true);
         setCursor(Qt::CrossCursor);
     }
     void setActual(float h, float e) { m_actH = h; m_actE = e; update(); }
@@ -43,17 +44,19 @@ protected:
 
     void mouseMoveEvent(QMouseEvent *ev) override {
         if (!m_captured) return;
+        QPoint center = mapToGlobal(rect().center());
         QPoint globalPos = ev->globalPos();
-        if (globalPos == m_captureCenter) return; // skip the warp-back synthetic event
-        QPoint delta = globalPos - m_captureCenter;
-        float h = m_tgtH + delta.x() * 0.5f;
-        float e = m_tgtE - delta.y() * 0.5f;
+        if (globalPos == center) return; // skip the warp-back synthetic event
+        QPoint delta = globalPos - center;
+        // Scale so 1px of mouse movement = 1px of crosshair movement on screen (1:1 visual tracking)
+        float h = m_tgtH + delta.x() * (360.0f / width());
+        float e = m_tgtE - delta.y() * (180.0f / height());
         h = static_cast<float>(fmod(h + 540.0, 360.0)) - 180.0f;
         e = qBound(-90.0f, e, 90.0f);
         m_tgtH = h; m_tgtE = e;
         update();
         emit targetChanged(m_tgtH, m_tgtE);
-        QCursor::setPos(m_captureCenter);
+        QCursor::setPos(center);
     }
 
     void keyPressEvent(QKeyEvent *ev) override {

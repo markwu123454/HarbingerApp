@@ -287,7 +287,8 @@ void MainWindow::applyTheme() {
 
     // Container backgrounds (these override the global stylesheet)
     m_topbar->setStyleSheet(
-        QString("background:%1;").arg(Theme::topbarBg().name()));
+        QString("background:%1; border-bottom:1px solid %2;")
+            .arg(Theme::topbarBg().name(), Theme::border().name()));
     m_sidebar->setStyleSheet(
         QString("background:%1; border-right:1px solid %2;")
             .arg(Theme::windowBg().name(), Theme::border().name()));

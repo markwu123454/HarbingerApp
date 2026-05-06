@@ -6,7 +6,7 @@
 #include <QMouseEvent>
 #include <QFont>
 #include <cmath>
-#include "theme.h"
+#include "../theme.h"
 
 // 2D drag pad: drag to set heading/elevation target.
 // Blue diamond = actual position (from telemetry).

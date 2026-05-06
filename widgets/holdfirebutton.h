@@ -5,7 +5,7 @@
 #include <QFont>
 #include <QTimer>
 #include <QMouseEvent>
-#include "theme.h"
+#include "../theme.h"
 
 // Hold 600 ms to fire; shows a progress arc while held.
 class HoldFireButton : public QWidget {

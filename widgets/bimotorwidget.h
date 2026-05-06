@@ -3,7 +3,7 @@
 #include <QPainter>
 #include <QPen>
 #include <QFont>
-#include "theme.h"
+#include "../theme.h"
 
 class BiMotorWidget : public QWidget {
     Q_OBJECT

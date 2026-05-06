@@ -5,8 +5,8 @@
 #include <QFont>
 #include <cmath>
 #include <limits>
-#include "protocol.h"
-#include "theme.h"
+#include "../protocol.h"
+#include "../theme.h"
 
 class CompassWidget : public QWidget {
     Q_OBJECT

@@ -6,7 +6,7 @@
 #include <QFont>
 #include <cmath>
 #include <limits>
-#include "theme.h"
+#include "../theme.h"
 
 class ElevationWidget : public QWidget {
     Q_OBJECT

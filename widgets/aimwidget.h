@@ -4,18 +4,22 @@
 #include <QPen>
 #include <QPolygonF>
 #include <QMouseEvent>
+#include <QKeyEvent>
 #include <QFont>
+#include <QApplication>
+#include <QCursor>
 #include <cmath>
 #include "../theme.h"
 
-// 2D drag pad: drag to set heading/elevation target.
+// 2D drag pad: click to capture mouse (3D-game style), ESC to release.
 // Blue diamond = actual position (from telemetry).
-// White crosshair = target position.
+// Themed crosshair = target position.
 class AimWidget : public QWidget {
     Q_OBJECT
 public:
     explicit AimWidget(QWidget *parent = nullptr) : QWidget(parent) {
         setMinimumSize(200, 200);
+        setFocusPolicy(Qt::StrongFocus);
         setCursor(Qt::CrossCursor);
     }
     void setActual(float h, float e) { m_actH = h; m_actE = e; update(); }
@@ -27,25 +31,38 @@ signals:
 
 protected:
     void mousePressEvent(QMouseEvent *ev) override {
-        if (ev->button() != Qt::LeftButton) return;
-        m_dragging   = true;
-        m_dragStart  = ev->pos();
-        m_dragStartH = m_tgtH;
-        m_dragStartE = m_tgtE;
+        if (ev->button() != Qt::LeftButton || m_captured) return;
+        m_captured = true;
+        m_captureCenter = mapToGlobal(rect().center());
+        QCursor::setPos(m_captureCenter);
+        QApplication::setOverrideCursor(Qt::BlankCursor);
+        grabMouse();
+        setFocus();
+        update();
     }
+
     void mouseMoveEvent(QMouseEvent *ev) override {
-        if (!m_dragging) return;
-        QPoint delta = ev->pos() - m_dragStart;
-        float h = m_dragStartH + delta.x() * 0.5f;
-        float e = m_dragStartE - delta.y() * 0.5f;
+        if (!m_captured) return;
+        QPoint globalPos = ev->globalPos();
+        if (globalPos == m_captureCenter) return; // skip the warp-back synthetic event
+        QPoint delta = globalPos - m_captureCenter;
+        float h = m_tgtH + delta.x() * 0.5f;
+        float e = m_tgtE - delta.y() * 0.5f;
         h = static_cast<float>(fmod(h + 540.0, 360.0)) - 180.0f;
         e = qBound(-90.0f, e, 90.0f);
         m_tgtH = h; m_tgtE = e;
         update();
         emit targetChanged(m_tgtH, m_tgtE);
+        QCursor::setPos(m_captureCenter);
     }
-    void mouseReleaseEvent(QMouseEvent *ev) override {
-        if (ev->button() == Qt::LeftButton) m_dragging = false;
+
+    void keyPressEvent(QKeyEvent *ev) override {
+        if (ev->key() == Qt::Key_Escape && m_captured)
+            releaseCapture();
+    }
+
+    void focusOutEvent(QFocusEvent *) override {
+        if (m_captured) releaseCapture();
     }
 
     void paintEvent(QPaintEvent *) override {
@@ -78,8 +95,9 @@ protected:
                 << QPointF(actPt.x() - ds, actPt.y());
         p.drawPolygon(diamond);
 
-        // Target — white crosshair
-        p.setPen(QPen(Qt::white, 1.5));
+        // Target — crosshair
+        QColor ch = Theme::aimCrosshair();
+        p.setPen(QPen(ch, 1.5));
         p.setBrush(Qt::NoBrush);
         double cs = 13;
         p.drawLine(QPointF(tgtPt.x() - cs, tgtPt.y()), QPointF(tgtPt.x() - 4,  tgtPt.y()));
@@ -98,13 +116,12 @@ protected:
             QString("ACT  %1\xc2\xb0  %2\xc2\xb0")
                 .arg(m_actH, 0, 'f', 1).arg(m_actE, 0, 'f', 1));
 
-        // Drag hint
-        if (!m_dragging) {
-            p.setPen(Theme::aimHintText());
-            p.setFont(QFont("Segoe UI", 9));
-            p.drawText(rect().adjusted(0, 0, 0, -8),
-                       Qt::AlignHCenter | Qt::AlignBottom, "drag to aim");
-        }
+        // Hint
+        p.setPen(Theme::aimHintText());
+        p.setFont(QFont("Segoe UI", 9));
+        p.drawText(rect().adjusted(0, 0, 0, -8),
+                   Qt::AlignHCenter | Qt::AlignBottom,
+                   m_captured ? "ESC to release" : "click to aim");
 
         // Disarmed overlay
         if (!m_turretArmed) {
@@ -119,9 +136,15 @@ private:
     float  m_tgtH = 0, m_tgtE = 0;
     float  m_actH = 0, m_actE = 0;
     bool   m_turretArmed = false;
-    bool   m_dragging    = false;
-    QPoint m_dragStart;
-    float  m_dragStartH = 0, m_dragStartE = 0;
+    bool   m_captured    = false;
+    QPoint m_captureCenter;
+
+    void releaseCapture() {
+        m_captured = false;
+        releaseMouse();
+        QApplication::restoreOverrideCursor();
+        update();
+    }
 
     QPointF worldToScreen(float h, float e) const {
         double nx = (h + 180.0) / 360.0;

@@ -29,6 +29,7 @@ public:
 private:
     // ── Topbar ────────────────────────────────────────────────────
     QWidget *m_topbar      = nullptr;
+    QLabel  *m_titleLabel  = nullptr;
     QLabel  *m_statusDot   = nullptr;
     QLabel  *m_statusLabel = nullptr;
     QLabel  *m_masterBadge = nullptr;

@@ -14,12 +14,13 @@ inline bool isDark() {
 }
 
 // ── Container backgrounds ────────────────────────────────────────
-inline QColor topbarBg()  { return isDark() ? QColor(0x0d, 0x11, 0x17) : QColor(0x1a, 0x23, 0x32); }
+inline QColor topbarBg()  { return isDark() ? QColor(0x0d, 0x11, 0x17) : QColor(0xf3, 0xf4, 0xf6); }
+inline QColor topbarText() { return isDark() ? QColor(0xff, 0xff, 0xff) : QColor(0x1a, 0x23, 0x32); }
 inline QColor windowBg()  { return isDark() ? QColor(0x1e, 0x21, 0x28) : QColor(0xf3, 0xf4, 0xf6); }
 inline QColor surfaceBg() { return isDark() ? QColor(0x27, 0x2b, 0x33) : QColor(0xff, 0xff, 0xff); }
 inline QColor stripBg()   { return isDark() ? QColor(0x16, 0x19, 0x1f) : QColor(0xf9, 0xfa, 0xfb); }
 inline QColor widgetBg()  { return isDark() ? QColor(0x22, 0x26, 0x2e) : QColor(0xf8, 0xf9, 0xfa); }
-inline QColor aimBg()     { return isDark() ? QColor(0x0d, 0x11, 0x17) : QColor(0x22, 0x2c, 0x3e); }
+inline QColor aimBg()     { return isDark() ? QColor(0x0d, 0x11, 0x17) : QColor(0xf0, 0xf2, 0xf5); }
 
 // ── Borders ───────────────────────────────────────────────────────
 inline QColor border()      { return isDark() ? QColor(0x3a, 0x40, 0x4c) : QColor(0xd1, 0xd5, 0xdb); }
@@ -35,10 +36,11 @@ inline QColor textMuted()     { return isDark() ? QColor(0x6b, 0x72, 0x80) : QCo
 inline QColor centerDot()     { return isDark() ? QColor(0xe5, 0xe7, 0xeb) : QColor(0x1a, 0x23, 0x32); }
 
 // ── AimWidget-specific ───────────────────────────────────────────
-inline QColor gridLine()       { return QColor(255, 255, 255, isDark() ? 18 : 10); }
-inline QColor centerLine()     { return QColor(255, 255, 255, isDark() ? 35 : 20); }
-inline QColor aimOverlayText() { return QColor(255, 255, 255, isDark() ? 110 : 150); }
-inline QColor aimHintText()    { return QColor(255, 255, 255, isDark() ? 40 : 60); }
+inline QColor gridLine()       { return isDark() ? QColor(255, 255, 255, 18)  : QColor(0, 0, 0, 12); }
+inline QColor centerLine()     { return isDark() ? QColor(255, 255, 255, 35)  : QColor(0, 0, 0, 25); }
+inline QColor aimOverlayText() { return isDark() ? QColor(255, 255, 255, 110) : QColor(0, 0, 0, 140); }
+inline QColor aimHintText()    { return isDark() ? QColor(255, 255, 255, 40)  : QColor(0, 0, 0, 70); }
+inline QColor aimCrosshair()   { return isDark() ? QColor(255, 255, 255)      : QColor(0x1a, 0x23, 0x32); }
 
 // ── Application-wide Qt stylesheet ───────────────────────────────
 inline QString stylesheet() {

@@ -410,8 +410,15 @@ void MainWindow::onConnected(SOCKET sock, const QString &name) {
     m_statusLabel->setText(name);
     m_statusLabel->setStyleSheet("color:#bbf7d0; font-size:12px;");
 
-    setControlsEnabled(true);
-    logEvent(QString("=== Connected to %1 ===").arg(name));
+    // Enable only disconnect while we wait for the firmware's initial state dump.
+    // The rest of the controls (arm, fire, voltage) become live in handlePacket()
+    // once MSG_STATE is received, so the app always sees current state before acting.
+    m_disconnBtnRef->setEnabled(true);
+    m_scanBtnRef->setEnabled(false);
+    m_connectBtnRef->setEnabled(false);
+    m_waitingForInitialState = true;
+
+    logEvent(QString("=== Connected to %1 — waiting for initial state ===").arg(name));
 
     m_ioThread = new QThread(this);
     m_ioWorker = new IoWorker(sock);
@@ -435,7 +442,21 @@ void MainWindow::disconnectDevice() {
         delete m_ioThread; m_ioThread = nullptr;
     }
     if (m_sock != INVALID_SOCKET) { closesocket(m_sock); m_sock = INVALID_SOCKET; }
+
     setControlsEnabled(false);
+    m_waitingForInitialState = false;
+
+    // Reset arm button checked states so the next connection starts fresh
+    // (no stale state from the previous session shown before MSG_STATE arrives).
+    for (auto *btn : {m_masterArmBtn, m_turretArmBtn, m_gunArmBtn})
+        btn->blockSignals(true);
+    m_masterArmBtn->setChecked(false);
+    m_turretArmBtn->setChecked(false);
+    m_gunArmBtn->setChecked(false);
+    for (auto *btn : {m_masterArmBtn, m_turretArmBtn, m_gunArmBtn})
+        btn->blockSignals(false);
+    m_masterArmed = m_turretArmed = m_gunArmed = false;
+
     m_masterBadge->setVisible(false);
     m_turretBadge->setVisible(false);
     m_gunBadge->setVisible(false);
@@ -556,6 +577,13 @@ void MainWindow::handlePacket(uint8_t type, QByteArray payload) {
         logEvent(QString("\xe2\x86\x90 STATE arm=[%1] v=%2V")
             .arg(armed.isEmpty() ? "none" : armed.join(","))
             .arg(pkt.target_v, 0, 'f', 1));
+
+        // Enable all controls now that we have the authoritative initial state.
+        if (m_waitingForInitialState) {
+            m_waitingForInitialState = false;
+            setControlsEnabled(true);
+            logEvent("=== Initial state received — controls enabled ===");
+        }
         break;
     }
 

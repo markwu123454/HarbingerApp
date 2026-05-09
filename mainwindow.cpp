@@ -622,6 +622,18 @@ void MainWindow::handlePacket(uint8_t type, QByteArray payload) {
         break;
     }
 
+    case MSG_LOG: {
+        if (payload.size() < 2) break;
+        uint8_t level = static_cast<uint8_t>(payload.at(0));
+        uint8_t slen  = static_cast<uint8_t>(payload.at(1));
+        QString text  = QString::fromLatin1(payload.constData() + 2,
+                                            qMin((int)slen, payload.size() - 2));
+        const char* prefix = (level == LOG_ERROR) ? "[ERR]" :
+                             (level == LOG_WARN)  ? "[WRN]" : "[LOG]";
+        logEvent(QString("%1 %2").arg(prefix, text));
+        break;
+    }
+
     default:
         logEvent(QString("\xe2\x86\x90 unknown 0x%1").arg(type, 2, 16, QChar('0')));
     }

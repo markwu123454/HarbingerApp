@@ -54,6 +54,7 @@ private:
                 size_t psiz = payloadSize(b);
                 if (psiz == SIZE_MAX) break;
                 if (b == MSG_SHOT)  { m_rxExpected = 5; m_rxState = RxState::PAYLOAD; }
+                else if (b == MSG_LOG) { m_rxExpected = 2; m_rxState = RxState::PAYLOAD; }
                 else if (psiz == 0) { emit packetReceived(b, QByteArray()); }
                 else                { m_rxExpected = psiz; m_rxState = RxState::PAYLOAD; }
             }
@@ -69,6 +70,15 @@ private:
                     } else {
                         m_rxExpected = 5 + static_cast<size_t>(hdr.stage_count) * 12;
                         m_rxState = RxState::SHOT_STAGES;
+                    }
+                } else if (m_rxType == MSG_LOG && static_cast<size_t>(m_rxBuf.size()) == 2) {
+                    // Header received: byte 0=level, byte 1=slen.
+                    // If slen>0 stay in PAYLOAD and read slen more bytes.
+                    uint8_t slen = static_cast<uint8_t>(m_rxBuf.at(1));
+                    if (slen > 0) {
+                        m_rxExpected = 2 + slen;
+                    } else {
+                        emit packetReceived(MSG_LOG, m_rxBuf); m_rxState = RxState::TYPE;
                     }
                 } else {
                     emit packetReceived(m_rxType, m_rxBuf); m_rxState = RxState::TYPE;
@@ -90,6 +100,7 @@ private:
         case MSG_STATE:     return 5;
         case MSG_TELEMETRY: return 24;
         case MSG_SHOT:      return 5;
+        case MSG_LOG:       return 2;  // header only; extended after slen is known
         default:            return SIZE_MAX;
         }
     }

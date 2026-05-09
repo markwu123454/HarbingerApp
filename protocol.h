@@ -16,6 +16,12 @@ constexpr uint8_t MSG_PONG        = 0x81;
 constexpr uint8_t MSG_STATE       = 0x82;
 constexpr uint8_t MSG_TELEMETRY   = 0x83;
 constexpr uint8_t MSG_SHOT        = 0x84;
+constexpr uint8_t MSG_LOG         = 0x85;  // uint8_t level, uint8_t slen, char msg[slen]
+
+// ── Log levels ───────────────────────────────────────────────
+constexpr uint8_t LOG_INFO  = 0;
+constexpr uint8_t LOG_WARN  = 1;
+constexpr uint8_t LOG_ERROR = 2;
 
 // ── Arm flag encoding ────────────────────────────────────────────
 constexpr uint8_t ARM_SHIFT_MASTER = 0;

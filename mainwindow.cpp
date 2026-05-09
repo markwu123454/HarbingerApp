@@ -91,9 +91,9 @@ void MainWindow::buildUi() {
     topH->addWidget(m_gunBadge);
     topH->addSpacing(16);
 
-    auto *titleLbl = new QLabel("HARBINGER");
-    titleLbl->setStyleSheet("color:white; font-size:15px; font-weight:700; letter-spacing:3px;");
-    topH->addWidget(titleLbl);
+    m_titleLabel = new QLabel("HARBINGER");
+    m_titleLabel->setStyleSheet("font-size:15px; font-weight:700; letter-spacing:3px;");
+    topH->addWidget(m_titleLabel);
     rootV->addWidget(m_topbar);
 
     // ── Content row ───────────────────────────────────────────────
@@ -287,7 +287,8 @@ void MainWindow::applyTheme() {
 
     // Container backgrounds (these override the global stylesheet)
     m_topbar->setStyleSheet(
-        QString("background:%1;").arg(Theme::topbarBg().name()));
+        QString("background:%1; border-bottom:1px solid %2;")
+            .arg(Theme::topbarBg().name(), Theme::border().name()));
     m_sidebar->setStyleSheet(
         QString("background:%1; border-right:1px solid %2;")
             .arg(Theme::windowBg().name(), Theme::border().name()));
@@ -295,7 +296,10 @@ void MainWindow::applyTheme() {
         QString("background:%1; border-top:1px solid %2;")
             .arg(Theme::stripBg().name(), Theme::border().name()));
 
-    // Topbar text colors (status label uses state-specific colors set elsewhere)
+    // Topbar text colors
+    m_titleLabel->setStyleSheet(
+        QString("color:%1; font-size:15px; font-weight:700; letter-spacing:3px;")
+            .arg(Theme::topbarText().name()));
     m_statusLabel->setStyleSheet("font-size:12px;");
 
     // Sidebar widgets

@@ -61,9 +61,10 @@ private:
     QList<QWidget*>  m_telCells;
 
     // ── State ─────────────────────────────────────────────────────
-    bool m_masterArmed = false;
-    bool m_turretArmed = false;
-    bool m_gunArmed    = false;
+    bool m_masterArmed            = false;
+    bool m_turretArmed            = false;
+    bool m_gunArmed               = false;
+    bool m_waitingForInitialState = false;
 
     // ── Networking ────────────────────────────────────────────────
     QList<BtDevice> m_devices;

@@ -18,7 +18,9 @@ add_executable(HarbingerApp WIN32
     protocol.h
     btdevice.h
     scanworker.h
+    scanworker.cpp
     ioworker.h
+    ioworker.cpp
     theme.h
     widgets/aimwidget.h
     widgets/compasswidget.h

@@ -53,7 +53,7 @@ MainWindow::~MainWindow() {
     WSACleanup();
 }
 
-// ── UI construction ───────────────────────────────────────────────
+// ── UI construction ──────────────────────────────────────────────
 void MainWindow::buildUi() {
     auto *root  = new QWidget(this);
     setCentralWidget(root);
@@ -61,7 +61,7 @@ void MainWindow::buildUi() {
     rootV->setContentsMargins(0, 0, 0, 0);
     rootV->setSpacing(0);
 
-    // ── Topbar ────────────────────────────────────────────────────
+    // ── Topbar ──────────────────────────────────────────────
     m_topbar = new QWidget;
     m_topbar->setFixedHeight(44);
     auto *topH = new QHBoxLayout(m_topbar);
@@ -86,9 +86,11 @@ void MainWindow::buildUi() {
     m_masterBadge = makeBadge("MASTER", "#92400e", "#fbbf24");
     m_turretBadge = makeBadge("TURRET", "#1e3a5f", "#60a5fa");
     m_gunBadge    = makeBadge("GUN",    "#7f1d1d", "#fca5a5");
+    m_calBadge    = makeBadge("UNCAL",  "#78350f", "#fde68a");  // amber; shown when NOT calibrated
     topH->addWidget(m_masterBadge);
     topH->addWidget(m_turretBadge);
     topH->addWidget(m_gunBadge);
+    topH->addWidget(m_calBadge);
     topH->addSpacing(16);
 
     m_titleLabel = new QLabel("HARBINGER");
@@ -96,13 +98,13 @@ void MainWindow::buildUi() {
     topH->addWidget(m_titleLabel);
     rootV->addWidget(m_topbar);
 
-    // ── Content row ───────────────────────────────────────────────
+    // ── Content row ─────────────────────────────────────────────
     auto *content  = new QWidget;
     auto *contentH = new QHBoxLayout(content);
     contentH->setContentsMargins(0, 0, 0, 0);
     contentH->setSpacing(0);
 
-    // ── Left sidebar ──────────────────────────────────────────────
+    // ── Left sidebar ─────────────────────────────────────────────
     m_sidebar = new QWidget;
     m_sidebar->setFixedWidth(220);
     auto *sideV = new QVBoxLayout(m_sidebar);
@@ -200,6 +202,19 @@ void MainWindow::buildUi() {
     fireCenter->addStretch();
     sideV->addLayout(fireCenter);
 
+    addSep();
+
+    // Calibration
+    addSectionLabel("CALIBRATION");
+    m_clearCalBtn = new QPushButton("Clear & Re-align");
+    m_clearCalBtn->setStyleSheet("font-size:11px; padding:4px 8px;");
+    m_clearCalBtn->setEnabled(false);
+    m_clearCalBtn->setToolTip(
+        "Erase stored FOC calibration and reboot device.\n"
+        "Device will run a live alignment sweep on next boot.\n"
+        "Requires 24 V motor power to be connected.");
+    sideV->addWidget(m_clearCalBtn);
+
     sideV->addStretch();
 
     // Event log
@@ -211,7 +226,7 @@ void MainWindow::buildUi() {
 
     contentH->addWidget(m_sidebar);
 
-    // ── Right: aim pad + telemetry strip ──────────────────────────
+    // ── Right: aim pad + telemetry strip ────────────────────────
     auto *rightWidget = new QWidget;
     auto *rightV      = new QVBoxLayout(rightWidget);
     rightV->setContentsMargins(0, 0, 0, 0);
@@ -254,7 +269,7 @@ void MainWindow::buildUi() {
     contentH->addWidget(rightWidget, 1);
     rootV->addWidget(content, 1);
 
-    // ── Signal connections ────────────────────────────────────────
+    // ── Signal connections ───────────────────────────────────────
     connect(scanBtn, &QPushButton::clicked, this, [this]() {
         if (!m_scanning) doAutoScan();
     });
@@ -273,7 +288,8 @@ void MainWindow::buildUi() {
         m_voltLabel->setText(QString("%1 V").arg(v));
     });
     connect(m_voltSlider, &QSlider::sliderReleased, this, &MainWindow::onVoltageReleased);
-    connect(m_fireBtn,   &HoldFireButton::fired,    this, &MainWindow::onFire);
+    connect(m_fireBtn,    &HoldFireButton::fired,   this, &MainWindow::onFire);
+    connect(m_clearCalBtn, &QPushButton::clicked,   this, &MainWindow::onClearCal);
     connect(m_aimWidget, &AimWidget::targetChanged, this, [this](float h, float e) {
         m_compass->setTarget(h);
         m_elevation->setTarget(e);
@@ -445,6 +461,7 @@ void MainWindow::disconnectDevice() {
 
     setControlsEnabled(false);
     m_waitingForInitialState = false;
+    m_calBadge->setVisible(false);
 
     // Reset arm button checked states so the next connection starts fresh
     // (no stale state from the previous session shown before MSG_STATE arrives).
@@ -482,12 +499,13 @@ void MainWindow::setControlsEnabled(bool en) {
     m_gunArmBtn->setEnabled(en);
     m_voltSlider->setEnabled(en);
     m_fireBtn->setEnabled(en);
+    m_clearCalBtn->setEnabled(en);
     m_disconnBtnRef->setEnabled(en);
     m_scanBtnRef->setEnabled(!en);
     m_connectBtnRef->setEnabled(!en && m_deviceList->currentRow() >= 0);
 }
 
-// ── Arm toggles ───────────────────────────────────────────────────
+// ── Arm toggles ───────────────────────────────────────────────
 void MainWindow::onMasterArmToggled(bool checked) {
     if (!m_ioWorker) {
         m_masterArmBtn->blockSignals(true);
@@ -537,7 +555,13 @@ void MainWindow::onFire() {
     m_ioWorker->sendFire();
 }
 
-// ── Packet receive ────────────────────────────────────────────────
+void MainWindow::onClearCal() {
+    if (!m_ioWorker) return;
+    logEvent("\xe2\x86\x92 CLEAR_CALIBRATION (device will reboot and run live alignment)");
+    m_ioWorker->sendClearCalibration();
+}
+
+// ── Packet receive ──────────────────────────────────────────────
 void MainWindow::handlePacket(uint8_t type, QByteArray payload) {
     switch (type) {
     case MSG_PONG:
@@ -551,6 +575,7 @@ void MainWindow::handlePacket(uint8_t type, QByteArray payload) {
         m_masterArmed = pkt.flags & STATE_MASTER_ARM;
         m_turretArmed = pkt.flags & STATE_TURRET_ARM;
         m_gunArmed    = pkt.flags & STATE_GUN_ARM;
+        bool cal      = pkt.flags & STATE_CAL_OK;
 
         for (auto *btn : {m_masterArmBtn, m_turretArmBtn, m_gunArmBtn})
             btn->blockSignals(true);
@@ -568,15 +593,21 @@ void MainWindow::handlePacket(uint8_t type, QByteArray payload) {
         m_masterBadge->setVisible(m_masterArmed);
         m_turretBadge->setVisible(m_turretArmed);
         m_gunBadge->setVisible(m_gunArmed);
+        m_calBadge->setVisible(!cal);  // amber UNCAL badge shown when NOT calibrated
         m_aimWidget->setArmed(m_turretArmed);
 
         QStringList armed;
         if (m_masterArmed) armed << "MASTER";
         if (m_turretArmed) armed << "TURRET";
         if (m_gunArmed)    armed << "GUN";
-        logEvent(QString("\xe2\x86\x90 STATE arm=[%1] v=%2V")
+        logEvent(QString("\xe2\x86\x90 STATE arm=[%1] v=%2V cal=%3")
             .arg(armed.isEmpty() ? "none" : armed.join(","))
-            .arg(pkt.target_v, 0, 'f', 1));
+            .arg(pkt.target_v, 0, 'f', 1)
+            .arg(cal ? "OK" : "FAIL"));
+
+        if (!cal) {
+            logEvent("[WRN] Motors not FOC-calibrated — connect 24 V and click Clear & Re-align");
+        }
 
         // Enable all controls now that we have the authoritative initial state.
         if (m_waitingForInitialState) {

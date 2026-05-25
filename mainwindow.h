@@ -27,7 +27,7 @@ public:
     ~MainWindow() override;
 
 private:
-    // ── Topbar ────────────────────────────────────────────────────
+    // ── Topbar ──────────────────────────────────────────────
     QWidget *m_topbar      = nullptr;
     QLabel  *m_titleLabel  = nullptr;
     QLabel  *m_statusDot   = nullptr;
@@ -35,8 +35,9 @@ private:
     QLabel  *m_masterBadge = nullptr;
     QLabel  *m_turretBadge = nullptr;
     QLabel  *m_gunBadge    = nullptr;
+    QLabel  *m_calBadge    = nullptr;  // amber UNCAL warning; hidden when calibrated
 
-    // ── Sidebar ───────────────────────────────────────────────────
+    // ── Sidebar ───────────────────────────────────────────────
     QWidget        *m_sidebar      = nullptr;
     QListWidget    *m_deviceList   = nullptr;
     QPushButton    *m_scanBtnRef   = nullptr;
@@ -48,10 +49,11 @@ private:
     QSlider        *m_voltSlider   = nullptr;
     QLabel         *m_voltLabel    = nullptr;
     HoldFireButton *m_fireBtn      = nullptr;
+    QPushButton    *m_clearCalBtn  = nullptr;  // sends MSG_CLEAR_CALIBRATION then device reboots
     QTextEdit      *m_eventLog     = nullptr;
     QList<QWidget*> m_separators;
 
-    // ── Main area ─────────────────────────────────────────────────
+    // ── Main area ───────────────────────────────────────────────
     AimWidget       *m_aimWidget  = nullptr;
     QWidget         *m_strip      = nullptr;
     CompassWidget   *m_compass    = nullptr;
@@ -60,20 +62,20 @@ private:
     BiMotorWidget   *m_motorB     = nullptr;
     QList<QWidget*>  m_telCells;
 
-    // ── State ─────────────────────────────────────────────────────
+    // ── State ──────────────────────────────────────────────────
     bool m_masterArmed            = false;
     bool m_turretArmed            = false;
     bool m_gunArmed               = false;
     bool m_waitingForInitialState = false;
 
-    // ── Networking ────────────────────────────────────────────────
+    // ── Networking ──────────────────────────────────────────────
     QList<BtDevice> m_devices;
     SOCKET          m_sock     = INVALID_SOCKET;
     QThread        *m_ioThread = nullptr;
     IoWorker       *m_ioWorker = nullptr;
     bool            m_scanning = false;
 
-    // ── Auto-scan ─────────────────────────────────────────────────
+    // ── Auto-scan ────────────────────────────────────────────────
     QTimer *m_autoScanTimer = nullptr;
     bool    m_autoScan      = true;
 
@@ -94,6 +96,7 @@ private:
     void onGunArmToggled(bool checked);
     void onVoltageReleased();
     void onFire();
+    void onClearCal();
 
     void handlePacket(uint8_t type, QByteArray payload);
 };

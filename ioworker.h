@@ -21,6 +21,7 @@ public:
     void sendArm(uint8_t f)       { PktArm p{f};    msgSend(MSG_ARM, &p, sizeof(p)); }
     void sendSetVoltage(float v)  { PktSetVoltage p{v}; msgSend(MSG_SET_VOLTAGE, &p, sizeof(p)); }
     void sendFire()               { uint8_t b = MSG_FIRE; rawSend(&b, 1); }
+    void sendClearCalibration()   { uint8_t b = MSG_CLEAR_CALIBRATION; rawSend(&b, 1); }
 
 public slots:
     void run() {

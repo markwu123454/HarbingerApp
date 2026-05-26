@@ -30,8 +30,8 @@ protected:
         double x1      = r.left() + 8;
         double x2      = x1 + barW + 4;
 
-        auto drawBar = [&](double x, float val, QColor col) {
-            double frac = qBound(-1.0, static_cast<double>(val) / 10.0, 1.0);
+        auto drawBar = [&](double x, float val, float scale, QColor col) {
+            double frac = qBound(-1.0, static_cast<double>(val) / scale, 1.0);
             double h    = frac * barH / 2.0;
             p.setPen(Qt::NoPen);
             p.setBrush(Theme::trackBg());
@@ -45,8 +45,8 @@ protected:
             p.drawLine(QPointF(x, centerY), QPointF(x + barW, centerY));
         };
 
-        drawBar(x1, m_vel, QColor(0x3b, 0x82, 0xf6, 200));
-        drawBar(x2, m_acc, QColor(0xf5, 0x9e, 0x0b, 200));
+        drawBar(x1, m_vel, 10.0f,  QColor(0x3b, 0x82, 0xf6, 200));  // ±10 rad/s full scale
+        drawBar(x2, m_acc, 100.0f, QColor(0xf5, 0x9e, 0x0b, 200)); // ±100 rad/s² full scale
 
         p.setFont(QFont("Segoe UI", 7));
         p.setPen(Theme::textMuted());
